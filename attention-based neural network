@@ -1,0 +1,338 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset, random_split
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score
+from tqdm import tqdm
+import time
+from datetime import timedelta
+from pathlib import Path
+
+
+print("1. Preparing dataset...")
+
+# Load TE and TM datasets (project-relative paths)
+DATA_DIR = Path(__file__).parent / 'data'
+file_path_te = DATA_DIR / 'TE.csv'   # TE diffraction efficiency
+file_path_tm = DATA_DIR / 'TM.csv'   # TM diffraction efficiency
+
+print("Reading TE mode data...")
+df_te = pd.read_csv(file_path_te, encoding_errors='ignore')
+print(f"TE dataframe shape: {df_te.shape}")
+print(f"TE dataframe columns: {df_te.columns.tolist()}")
+
+print("Reading TM mode data...")
+df_tm = pd.read_csv(file_path_tm, encoding_errors='ignore')
+print(f"TM dataframe shape: {df_tm.shape}")
+print(f"TM dataframe columns: {df_tm.columns.tolist()}")
+
+# Ensure both files share the same row count
+if df_te.shape[0] != df_tm.shape[0]:
+    raise ValueError(f"Row count mismatch between TE and TM datasets: {df_te.shape[0]} vs {df_tm.shape[0]}")
+
+# Use the first four columns as input features (assuming aligned ordering)
+X = df_te.iloc[:, :4].values  # Input parameters
+
+# Use the fifth column from each file as the dual-output target
+y_te = df_te.iloc[:, 4].values.reshape(-1, 1)  # TE diffraction efficiency
+y_tm = df_tm.iloc[:, 4].values.reshape(-1, 1)  # TM diffraction efficiency
+y = np.column_stack([y_te.flatten(), y_tm.flatten()])
+
+print(f"Input feature shape: {X.shape}")
+print(f"Target tensor shape: {y.shape}")
+print("Using dual-mode outputs: TE and TM diffraction efficiency")
+print("Employing multi-token architecture: each parameter acts as an independent token")
+
+# Standardize inputs
+scaler_X = StandardScaler()
+X = scaler_X.fit_transform(X)
+
+# Convert to torch tensors
+X_tensor = torch.tensor(X, dtype=torch.float32)
+y_tensor = torch.tensor(y, dtype=torch.float32)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Training device: {device}")
+
+# Build dataset and split
+dataset = TensorDataset(X_tensor, y_tensor)
+train_ratio = 0.6  # Train split ratio
+train_size = int(train_ratio * len(X_tensor))
+test_size = len(X_tensor) - train_size
+train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+X_train, y_train = train_dataset[:][0].to(device), train_dataset[:][1].to(device)
+X_test, y_test = test_dataset[:][0].to(device), test_dataset[:][1].to(device)
+
+print("Dataset split summary:")
+print(f"  Total samples: {len(X_tensor)}")
+print(f"  Train ratio: {train_ratio:.1f} ({train_size} samples)")
+print(f"  Test ratio: {1 - train_ratio:.1f} ({test_size} samples)")
+print(f"  Train/Test split: {train_size}/{test_size}")
+
+
+# 2. Multi-token model definition - dual-output attention network
+class MultiTokenDualOutputPhysicsInformedAttentionNet(nn.Module):
+    def __init__(self, input_dim, d_model=128, num_heads=1, num_layers=2):
+        super().__init__()
+        self.input_dim = input_dim
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+
+        # Each parameter receives an independent token embedding
+        # Map individual parameters into the shared d_model space
+        self.token_embeddings = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(1, d_model),
+                nn.LayerNorm(d_model),
+                nn.ReLU()
+            ) for _ in range(input_dim)
+        ])
+
+        # Custom Transformer encoder layers to extract attention weights
+        self.transformer_layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=num_heads,
+                dim_feedforward=256,
+                dropout=0.1,
+                batch_first=True
+            ) for _ in range(num_layers)
+        ])
+
+        # Dual-output branch - TE mode
+        self.te_output = nn.Sequential(
+            nn.Linear(d_model, 128),
+            nn.ReLU(),
+            nn.Linear(128, 512),
+            nn.ReLU(),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+
+        # Dual-output branch - TM mode
+        self.tm_output = nn.Sequential(
+            nn.Linear(d_model, 128),
+            nn.ReLU(),
+            nn.Linear(128, 512),
+            nn.ReLU(),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+
+    def forward(self, x, return_attention=False):
+        batch_size = x.size(0)
+
+        # Convert each parameter into an independent token embedding
+        # x: [batch_size, input_dim] -> tokens: [batch_size, input_dim, d_model]
+        tokens = []
+        for i in range(self.input_dim):
+            # Extract the i-th parameter [batch_size, 1]
+            param = x[:, i:i + 1]
+            # Convert to a token representation [batch_size, d_model]
+            token = self.token_embeddings[i](param)
+            tokens.append(token)
+
+        # Stack tokens -> [batch_size, input_dim, d_model]
+        token_sequence = torch.stack(tokens, dim=1)
+
+        # Pass token sequence through Transformer layers
+        attention_weights = []
+        encoded_tokens = token_sequence
+
+        if return_attention:
+            # Manually approximate dual-head attention weights
+            for i, layer in enumerate(self.transformer_layers):
+                # Estimate two-head attention weights
+                d_k = self.d_model // self.num_heads
+                multi_head_attention = []
+
+                for head in range(self.num_heads):
+                    # Each head processes a portion of the embedding dimension
+                    start_dim = head * d_k
+                    end_dim = (head + 1) * d_k
+
+                    # Extract features for this head
+                    head_tokens = encoded_tokens[:, :, start_dim:end_dim]  # [batch, seq, d_k]
+
+                    # Compute attention weights for this head
+                    norm_tokens = torch.nn.functional.normalize(head_tokens, dim=-1)
+                    head_attention = torch.matmul(norm_tokens, norm_tokens.transpose(-2, -1))
+                    head_attention = torch.softmax(head_attention, dim=-1)
+
+                    multi_head_attention.append(head_attention)
+
+                # Stack head attentions -> [batch_size, num_heads, seq_len, seq_len]
+                layer_attention = torch.stack(multi_head_attention, dim=1)
+                attention_weights.append(layer_attention.detach().cpu())
+
+                # Forward through the transformer layer
+                encoded_tokens = layer(encoded_tokens)
+        else:
+            # Standard forward propagation
+            for layer in self.transformer_layers:
+                encoded_tokens = layer(encoded_tokens)
+
+        # Aggregate token information using mean pooling
+        # [batch_size, input_dim, d_model] -> [batch_size, d_model]
+        pooled_features = encoded_tokens.mean(dim=1)
+
+        # Dual outputs (same architecture for both branches)
+        te_out = self.te_output(pooled_features)  # [batch_size, 1]
+        tm_out = self.tm_output(pooled_features)  # [batch_size, 1]
+
+        # Concatenate predictions
+        outputs = torch.cat([te_out, tm_out], dim=1)  # [batch_size, 2]
+
+        if return_attention:
+            return outputs, attention_weights
+        else:
+            return outputs
+
+
+print("\n2. Initializing multi-token dual-output model...")
+model = MultiTokenDualOutputPhysicsInformedAttentionNet(
+    input_dim=X_train.shape[1],  # Four parameters -> four tokens
+    d_model=128,
+    num_heads=2,
+    num_layers=1
+).to(device)
+
+# Report parameter counts
+total_params = sum(p.numel() for p in model.parameters())
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"Total parameters: {total_params:,}")
+print(f"Trainable parameters: {trainable_params:,}")
+
+# 3. Training configuration
+criterion = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
+
+train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=128, shuffle=True)
+
+# 4. Training loop
+print("\n3. Starting multi-token training (tracking full progress)...")
+best_loss = float('inf')
+total_epochs = 200  # Keep parity with the single-token training schedule
+total_steps = total_epochs * len(train_loader)
+start_time = time.time()
+
+progress_bar = tqdm(total=total_steps, desc="Multi-token training", unit="batch")
+
+for epoch in range(total_epochs):
+    model.train()
+    epoch_loss = 0
+
+    for X_batch, y_batch in train_loader:
+        optimizer.zero_grad()
+        outputs = model(X_batch)
+        loss = criterion(outputs, y_batch)
+        loss.backward()
+        optimizer.step()
+        epoch_loss += loss.item()
+
+    # Update progress bar statistics
+        elapsed = time.time() - start_time
+        steps_completed = epoch * len(train_loader) + 1
+        samples_processed = steps_completed * train_loader.batch_size
+        samples_per_sec = samples_processed / elapsed if elapsed > 0 else 0
+        progress_bar.update(1)
+        progress_bar.set_postfix({
+            'Epoch': f'{epoch + 1}/{total_epochs}',
+            'Loss': f'{loss.item():.4f}',
+            'Samples/sec': f'{samples_per_sec:.1f}',
+            'Elapsed': str(timedelta(seconds=int(elapsed)))
+        })
+
+    avg_train_loss = epoch_loss / len(train_loader)
+    model.eval()
+    with torch.no_grad():
+        val_outputs = model(X_test)
+        val_loss = criterion(val_outputs, y_test).item()
+
+    scheduler.step(val_loss)
+
+    # Persist the best-performing checkpoint
+    if val_loss < best_loss:
+        best_loss = val_loss
+        torch.save(model.state_dict(), 'best_multi_token_model.pth')
+
+# Save feature scaler
+import pickle
+
+with open('scaler_X_multi_token.pkl', 'wb') as f:
+    pickle.dump(scaler_X, f)
+print("Saved multi-token scaler to scaler_X_multi_token.pkl")
+
+progress_bar.close()
+
+# 8. Evaluate final performance metrics
+print("\n8. Evaluating final performance metrics...")
+
+# Load best-performing checkpoint
+model.load_state_dict(torch.load('best_multi_token_model.pth'))
+model.eval()
+
+with torch.no_grad():
+    # Generate final predictions on the test set
+    final_predictions = model(X_test).cpu().numpy()
+    final_true = y_test.cpu().numpy()
+
+    # Mean squared error
+    final_mse = np.mean((final_predictions - final_true) ** 2)
+
+    # R² scores
+    final_r2_overall = r2_score(final_true, final_predictions)
+    final_r2_te = r2_score(final_true[:, 0], final_predictions[:, 0])  # TE mode R²
+    final_r2_tm = r2_score(final_true[:, 1], final_predictions[:, 1])  # TM mode R²
+
+    # Success rates at two thresholds
+    delta1 = 0.05
+    delta2 = 0.1
+
+    # Success rate at δ=0.05
+    success_mask_005 = np.all(np.abs(final_predictions - final_true) < delta1, axis=1)
+    final_success_rate_005 = np.mean(success_mask_005) * 100
+
+    # Success rate at δ=0.1
+    success_mask_01 = np.all(np.abs(final_predictions - final_true) < delta2, axis=1)
+    final_success_rate_01 = np.mean(success_mask_01) * 100
+
+print("\n" + "=" * 60)
+print("🎯 Final performance of the multi-token model")
+print("=" * 60)
+print(f"📊 Test set size: {len(final_true):,} samples")
+print(f"📈 Final MSE: {final_mse:.6f}")
+print(f"📈 Final R² Score (overall): {final_r2_overall:.6f}")
+print(f"📈 Final R² Score (TE mode): {final_r2_te:.6f}")
+print(f"📈 Final R² Score (TM mode): {final_r2_tm:.6f}")
+print(f"🎯 Success rate (δ={delta1}): {final_success_rate_005:.2f}%")
+print(f"🎯 Success rate (δ={delta2}): {final_success_rate_01:.2f}%")
+print("=" * 60)
+
+# Additional error analysis
+te_mae = np.mean(np.abs(final_predictions[:, 0] - final_true[:, 0]))
+tm_mae = np.mean(np.abs(final_predictions[:, 1] - final_true[:, 1]))
+overall_mae = np.mean(np.abs(final_predictions - final_true))
+
+te_mse = np.mean((final_predictions[:, 0] - final_true[:, 0]) ** 2)
+tm_mse = np.mean((final_predictions[:, 1] - final_true[:, 1]) ** 2)
+
+print("📈 Mean Absolute Error (MAE):")
+print(f"   • Overall MAE: {overall_mae:.6f}")
+print(f"   • TE-mode MAE: {te_mae:.6f}")
+print(f"   • TM-mode MAE: {tm_mae:.6f}")
+print("📈 Mean Squared Error (MSE) breakdown:")
+print(f"   • Overall MSE: {final_mse:.6f}")
+print(f"   • TE-mode MSE: {te_mse:.6f}")
+print(f"   • TM-mode MSE: {tm_mse:.6f}")
+
+print("\n🎯 Training complete!")
+print("Model checkpoint saved successfully.")
+print("Artifacts saved: best_multi_token_model.pth and scaler_X_multi_token.pkl.")
