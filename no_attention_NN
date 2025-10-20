@@ -1,0 +1,238 @@
+import time
+from datetime import timedelta
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.preprocessing import StandardScaler
+from torch.utils.data import DataLoader, TensorDataset, random_split
+from tqdm import tqdm
+
+
+# 1) Data preparation (English-only, no visualization)
+print("1) Preparing data…")
+
+# Use project-relative paths for portability
+DATA_DIR = Path(__file__).parent / 'data'
+file_path_te = DATA_DIR / 'TE.csv'   # TE mode target (5th column or last valid ≥ index 4)
+file_path_tm = DATA_DIR / 'TM.csv'   # TM mode target (5th column or last valid ≥ index 4)
+
+if not file_path_te.exists() or not file_path_tm.exists():
+    raise FileNotFoundError(
+        f"Missing data files. Expected at: '{file_path_te}' and '{file_path_tm}'."
+    )
+
+print("Reading TE data…")
+df_te = pd.read_csv(file_path_te, encoding_errors='ignore')
+print(f"TE shape: {df_te.shape}")
+
+print("Reading TM data…")
+df_tm = pd.read_csv(file_path_tm, encoding_errors='ignore')
+print(f"TM shape: {df_tm.shape}")
+
+# Validate matching rows
+if df_te.shape[0] != df_tm.shape[0]:
+    raise ValueError(f"Row count mismatch between TE and TM: {df_te.shape[0]} vs {df_tm.shape[0]}")
+
+# Basic column count check
+min_required_cols = 5  # first 4 input features + at least 1 target column
+if df_te.shape[1] < min_required_cols:
+    raise ValueError(f'TE has too few columns; need >= {min_required_cols}, got {df_te.shape[1]}')
+if df_tm.shape[1] < min_required_cols:
+    raise ValueError(f'TM has too few columns; need >= {min_required_cols}, got {df_tm.shape[1]}')
+
+# First four columns as input features
+X = df_te.iloc[:, :4].values
+
+# Select target column: prefer 5th column (index 4); fallback to last valid col with index >= 4
+
+def _select_target_col(df: pd.DataFrame, prefer_idx: int = 4) -> int:
+    ncol = df.shape[1]
+    # Prefer exact 5th if has any non-NaN
+    if ncol > prefer_idx and df.iloc[:, prefer_idx].notna().any():
+        return prefer_idx
+    # Fallback: scan from right to left, index >= 4
+    for idx in range(ncol - 1, prefer_idx - 1, -1):
+        if df.iloc[:, idx].notna().any():
+            return idx
+    raise ValueError('No valid target column found (5th or any to its right).')
+
+te_col_idx = _select_target_col(df_te, prefer_idx=4)
+tm_col_idx = _select_target_col(df_tm, prefer_idx=4)
+print(f"TE target column -> index {te_col_idx}, name: {df_te.columns[te_col_idx]}")
+print(f"TM target column -> index {tm_col_idx}, name: {df_tm.columns[tm_col_idx]}")
+
+y_te = df_te.iloc[:, te_col_idx].values.reshape(-1, 1)
+y_tm = df_tm.iloc[:, tm_col_idx].values.reshape(-1, 1)
+y = np.column_stack([y_te.flatten(), y_tm.flatten()])  # dual outputs [TE, TM]
+
+print(f"Features shape: {X.shape}")
+print(f"Targets shape:  {y.shape} (TE, TM)")
+
+# Standardize features
+scaler_X = StandardScaler()
+X = scaler_X.fit_transform(X)
+
+# To tensors
+X_tensor = torch.tensor(X, dtype=torch.float32)
+y_tensor = torch.tensor(y, dtype=torch.float32)
+
+# Device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Device: {device}")
+
+# Dataset split (robust for small datasets)
+if len(X_tensor) < 2:
+    raise ValueError("Dataset too small to split into train/test. Need at least 2 samples.")
+
+dataset = TensorDataset(X_tensor, y_tensor)
+train_size = min(6000, len(X_tensor) - 1)  # cap train size; leave at least 1 for test
+test_size = len(X_tensor) - train_size
+train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+X_train, y_train = train_dataset[:][0].to(device), train_dataset[:][1].to(device)
+X_test, y_test = test_dataset[:][0].to(device), test_dataset[:][1].to(device)
+
+print("Split summary:")
+print(f"  Total:   {len(X_tensor)}")
+print(f"  Train:   {train_size}")
+print(f"  Test:    {test_size}")
+print(f"  Train %: {train_size / len(X_tensor) * 100:.1f}%")
+
+
+# 2) Model definition — Multi-token dual-output (no attention, ablation)
+class MultiTokenDualOutputPhysicsInformedNet(nn.Module):
+    """Ablated multi-token model without attention; uses per-feature embeddings and mean pooling."""
+
+    def __init__(self, input_dim: int, d_model: int = 64, num_heads: int = 2, num_layers: int = 1):
+        super().__init__()
+        self.input_dim = input_dim
+        self.d_model = d_model
+        self.num_heads = num_heads  # kept for interface compatibility
+        self.num_layers = num_layers  # kept for interface compatibility
+
+        # Per-parameter token embeddings
+        self.token_embeddings = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(1, d_model),
+                nn.LayerNorm(d_model),
+                nn.ReLU(),
+            )
+            for _ in range(input_dim)
+        ])
+
+        # Heads for TE/TM (shared pooled features -> two MLP heads)
+        self.te_output = nn.Sequential(
+            nn.Linear(d_model, 128),
+            nn.ReLU(),
+            nn.Linear(128, 512),
+            nn.ReLU(),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1),
+        )
+        self.tm_output = nn.Sequential(
+            nn.Linear(d_model, 128),
+            nn.ReLU(),
+            nn.Linear(128, 512),
+            nn.ReLU(),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1),
+        )
+
+    def forward(self, x: torch.Tensor, return_attention: bool = False):
+        # Build token sequence: [B, input_dim, d_model]
+        tokens = []
+        for i in range(self.input_dim):
+            token = self.token_embeddings[i](x[:, i:i + 1])
+            tokens.append(token)
+        token_sequence = torch.stack(tokens, dim=1)
+
+        # Mean pooling over tokens -> [B, d_model]
+        pooled = token_sequence.mean(dim=1)
+
+        # Dual outputs
+        te_out = self.te_output(pooled)
+        tm_out = self.tm_output(pooled)
+        out = torch.cat([te_out, tm_out], dim=1)  # [B, 2]
+
+        if return_attention:
+            return out, []  # interface compatibility; no attention in ablation
+        return out
+
+
+print("\n2) Initializing model (no-attention ablation)…")
+model = MultiTokenDualOutputPhysicsInformedNet(
+    input_dim=X_train.shape[1],
+    d_model=64,
+    num_heads=2,
+    num_layers=1,
+).to(device)
+
+# Parameter counts
+total_params = sum(p.numel() for p in model.parameters())
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"Total parameters:     {total_params:,}")
+print(f"Trainable parameters: {trainable_params:,}")
+
+
+# 3) Training config
+criterion = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
+train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=128, shuffle=True)
+
+
+# 4) Training loop (no plots; concise English logs)
+print("\n3) Start training (progress by batches)…")
+best_val_loss = float('inf')
+num_epochs = 200
+steps_total = num_epochs * len(train_loader)
+start_time = time.time()
+
+progress_bar = tqdm(total=steps_total, desc="Training", unit="batch")
+
+for epoch in range(num_epochs):
+    model.train()
+    epoch_loss = 0.0
+
+    for X_batch, y_batch in train_loader:
+        optimizer.zero_grad()
+        preds = model(X_batch)
+        loss = criterion(preds, y_batch)
+        loss.backward()
+        optimizer.step()
+        epoch_loss += loss.item()
+
+        progress_bar.update(1)
+        elapsed = time.time() - start_time
+        progress_bar.set_postfix({
+            'Epoch': f'{epoch + 1}/{num_epochs}',
+            'Loss': f'{loss.item():.6f}',
+            'Time': str(timedelta(seconds=int(elapsed))),
+        })
+
+    # Validation
+    model.eval()
+    with torch.no_grad():
+        val_loss = criterion(model(X_test), y_test).item()
+
+    scheduler.step(val_loss)
+
+    # Save best
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        torch.save(model.state_dict(), 'best_model_no_attention.pth')
+
+    print(f"Epoch {epoch + 1:03d}/{num_epochs} | train_loss={epoch_loss / len(train_loader):.6f} | val_loss={val_loss:.6f}")
+
+progress_bar.close()
+
+# Save scaler
+import pickle
+with open('scaler_X_no_attention.pkl', 'wb') as f:
+    pickle.dump(scaler_X, f)
+print("\n4) Training finished. Best checkpoint -> 'best_model_no_attention.pth'; Scaler -> 'scaler_X_no_attention.pkl'.")
