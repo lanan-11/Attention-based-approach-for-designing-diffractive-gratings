@@ -1,0 +1,1147 @@
+"""
+Interactive Grating Parameter Optimization System
+
+Features:
+1. Allow fixing specific parameters (lambda, n, alpha, f)
+2. Support setting optimization targets (TE, TM diffraction efficiency)
+3. Specify the number of solutions to search
+4. Return optimized parameter combinations
+
+Parameters:
+- lambda: wavelength
+- n: refractive index
+- alpha: angle
+- f: duty cycle
+"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+import pickle
+import os
+import time
+import warnings
+from typing import Dict, List, Tuple, Optional
+
+plt.rcParams['font.family'] = 'Times New Roman'
+plt.rcParams['font.size'] = 12
+plt.rcParams['axes.labelsize'] = 12
+plt.rcParams['axes.titlesize'] = 14
+plt.rcParams['xtick.labelsize'] = 10
+plt.rcParams['ytick.labelsize'] = 10
+plt.rcParams['legend.fontsize'] = 10
+plt.rcParams['figure.titlesize'] = 16
+plt.rcParams['axes.linewidth'] = 1.2
+plt.rcParams['grid.linewidth'] = 0.8
+plt.rcParams['lines.linewidth'] = 1.5
+plt.rcParams['axes.grid'] = True
+plt.rcParams['grid.alpha'] = 0.3
+plt.rcParams['axes.spines.top'] = False
+plt.rcParams['axes.spines.right'] = False
+
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning, module='matplotlib')
+
+# 1. Model definition - Multi-token dual-output attention network
+class MultiTokenDualOutputPhysicsInformedAttentionNet(nn.Module):
+    def __init__(self, input_dim, d_model=128, num_heads=2, num_layers=2):
+        super().__init__()
+        self.input_dim = input_dim
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+
+        # Each input parameter has its own token embedding (vs. single-token model)
+        # Map each parameter to d_model dimensions
+        self.token_embeddings = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(1, d_model),
+                nn.LayerNorm(d_model),
+                nn.ReLU()
+            ) for _ in range(input_dim)
+        ])
+
+        # Transformer encoder layers
+        self.transformer_layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=num_heads,
+                dim_feedforward=256,
+                dropout=0.1,
+                batch_first=True
+            ) for _ in range(num_layers)
+        ])
+
+        # Dual outputs - TE branch
+        self.te_output = nn.Sequential(
+            nn.Linear(d_model, 128),
+            nn.ReLU(),
+            nn.Linear(128, 512),
+            nn.ReLU(),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+
+        # Dual outputs - TM branch
+        self.tm_output = nn.Sequential(
+            nn.Linear(d_model, 128),
+            nn.ReLU(),
+            nn.Linear(128, 512),
+            nn.ReLU(),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+
+    def forward(self, x, return_attention=False):
+        batch_size = x.size(0)
+
+        # Convert each parameter to a token
+        # x shape: [batch_size, input_dim] -> tokens: [batch_size, input_dim, d_model]
+        tokens = []
+        for i in range(self.input_dim):
+            # Extract i-th parameter [batch_size, 1]
+            param = x[:, i:i + 1]
+            # Through embedding to token [batch_size, d_model]
+            token = self.token_embeddings[i](param)
+            tokens.append(token)
+
+        # Stack tokens [batch_size, input_dim, d_model]
+        token_sequence = torch.stack(tokens, dim=1)
+
+        # Transformer layers
+        attention_weights = []
+        encoded_tokens = token_sequence
+
+        if return_attention:
+            # Approximate multi-head attention weights
+            for i, layer in enumerate(self.transformer_layers):
+                # Compute per-head attention weights
+                d_k = self.d_model // self.num_heads
+                multi_head_attention = []
+
+                for head in range(self.num_heads):
+                    # Each head processes a slice of the feature dim
+                    start_dim = head * d_k
+                    end_dim = (head + 1) * d_k
+
+                    # Slice features for this head
+                    head_tokens = encoded_tokens[:, :, start_dim:end_dim]  # [batch, seq, d_k]
+
+                    # Compute attention weights for this head
+                    norm_tokens = torch.nn.functional.normalize(head_tokens, dim=-1)
+                    head_attention = torch.matmul(norm_tokens, norm_tokens.transpose(-2, -1))
+                    head_attention = torch.softmax(head_attention, dim=-1)
+
+                    multi_head_attention.append(head_attention)
+
+                # Stack heads -> [batch_size, num_heads, seq_len, seq_len]
+                layer_attention = torch.stack(multi_head_attention, dim=1)
+                attention_weights.append(layer_attention.detach().cpu())
+
+                # Pass through transformer layer
+                encoded_tokens = layer(encoded_tokens)
+        else:
+            # Normal forward
+            for layer in self.transformer_layers:
+                encoded_tokens = layer(encoded_tokens)
+
+        # Aggregate token information via mean pooling
+        # [batch_size, input_dim, d_model] -> [batch_size, d_model]
+        pooled_features = encoded_tokens.mean(dim=1)
+
+        # Dual outputs
+        te_out = self.te_output(pooled_features)  # [batch_size, 1]
+        tm_out = self.tm_output(pooled_features)  # [batch_size, 1]
+
+        # Concatenate outputs
+        outputs = torch.cat([te_out, tm_out], dim=1)  # [batch_size, 2]
+
+        if return_attention:
+            return outputs, attention_weights
+        else:
+            return outputs
+
+class InteractiveOptimizationSystem:
+    """Interactive optimization system"""
+
+    def __init__(self):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = None
+        self.scaler_X = None
+        self.param_min = None
+        self.param_max = None
+        self.param_names = ['lambda', 'n', 'alpha', 'f']
+        # Keep original output directory to avoid breaking user environment
+        self.save_dir = r'C:\Users\windows\Desktop\工作区\attention for design diffractive grating\fig'
+        os.makedirs(self.save_dir, exist_ok=True)
+
+        print("🔧 Interactive Grating Parameter Optimization (Multi-Token)")
+        print("=" * 50)
+        print(f"Device: {self.device}")
+        print("Using Multi-Token model — each parameter is an independent token")
+
+    def load_model_and_data(self):
+        """Load model and data"""
+        print("\nLoading model and data...")
+
+        # Check Multi-Token model files
+        model_path = 'best_multi_token_model.pth'
+        scaler_path = 'scaler_X_multi_token.pkl'
+
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model file {model_path} not found. Please train the model first.")
+
+        if not os.path.exists(scaler_path):
+            raise FileNotFoundError(f"Scaler file {scaler_path} not found. Please train the model first.")
+
+        # Load scaler
+        with open(scaler_path, 'rb') as f:
+            self.scaler_X = pickle.load(f)
+        print("Scaler loaded")
+
+        # Init and load Multi-Token model
+        self.model = MultiTokenDualOutputPhysicsInformedAttentionNet(
+            input_dim=4,  # 4 input parameters
+            d_model=128,
+            num_heads=2,
+            num_layers=1
+        ).to(self.device)
+
+        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+        self.model.eval()
+        print("Multi-Token model loaded")
+
+        # Load parameter bounds
+        self._load_parameter_ranges()
+
+    def _load_parameter_ranges(self):
+        """Load parameter bounds"""
+        print("\nSetting parameter bounds...")
+
+        try:
+            file_path_te = r'C:\Users\windows\Desktop\data\新三层矩形光栅\TE.csv'
+            df_te = pd.read_csv(file_path_te, encoding_errors='ignore')
+            X_range = df_te.iloc[:, :4].values
+
+            self.param_min = torch.tensor(X_range.min(axis=0), dtype=torch.float32, device=self.device)
+            self.param_max = torch.tensor(X_range.max(axis=0), dtype=torch.float32, device=self.device)
+
+            print(f"Parameter bounds:")
+            for i, name in enumerate(self.param_names):
+                print(f"  {name}: [{self.param_min[i]:.4f}, {self.param_max[i]:.4f}]")
+
+        except Exception as e:
+            print(f"Warning: Unable to read source CSV; using default parameter bounds")
+            print(f"Error: {e}")
+            # Reasonable default ranges
+            self.param_min = torch.tensor([0.0, 0.0, 0.0, 0.0], dtype=torch.float32, device=self.device)
+            self.param_max = torch.tensor([1.0, 1.0, 90.0, 2000.0], dtype=torch.float32, device=self.device)
+
+            print(f"Using default parameter bounds:")
+            for i, name in enumerate(self.param_names):
+                print(f"  {name}: [{self.param_min[i]:.4f}, {self.param_max[i]:.4f}]")
+
+    def get_user_constraints(self) -> Dict:
+        """Get user parameter constraints"""
+        print("\n" + "="*50)
+        print("Step 1: Set parameter constraints")
+        print("="*50)
+
+        constraints = {}
+
+        print("Select parameters to fix (multiple allowed):")
+        print("1. lambda (wavelength)")
+        print("2. n (refractive index)")
+        print("3. alpha (angle)")
+        print("4. f (duty cycle)")
+        print("5. Do not fix any parameter")
+
+        while True:
+            try:
+                choice = input("\nEnter selection (comma-separated, e.g., 1,3): ").strip()
+
+                if choice == '5':
+                    print("No fixed parameters; all will be optimized")
+                    break
+
+                # Parse input
+                fixed_params = []
+                for c in choice.split(','):
+                    c = c.strip()
+                    if c in ['1', '2', '3', '4']:
+                        param_idx = int(c) - 1
+                        param_name = self.param_names[param_idx]
+
+                        # Get fixed value
+                        min_val = self.param_min[param_idx].item()
+                        max_val = self.param_max[param_idx].item()
+
+                        while True:
+                            try:
+                                fixed_value = float(input(f"Enter fixed value for {param_name} (range: [{min_val:.4f}, {max_val:.4f}]): "))
+                                if min_val <= fixed_value <= max_val:
+                                    constraints[param_name] = fixed_value
+                                    fixed_params.append(param_name)
+                                    break
+                                else:
+                                    print(f"Value out of range. Please enter between [{min_val:.4f}, {max_val:.4f}].")
+                            except ValueError:
+                                print("Please enter a valid number.")
+
+                if fixed_params:
+                    print(f"Fixed parameters: {', '.join(fixed_params)}")
+                else:
+                    print("No parameters fixed")
+                break
+
+            except:
+                print("Invalid input format. Please try again.")
+
+        return constraints
+
+    def get_optimization_targets(self) -> Dict:
+        """Get optimization targets"""
+        print("\n" + "="*50)
+        print("Step 2: Set optimization targets")
+        print("="*50)
+
+        targets = {}
+
+        print("Select optimization mode:")
+        print("1. Optimize TE efficiency only")
+        print("2. Optimize TM efficiency only")
+        print("3. Optimize TE and TM (dual-target)")
+
+        while True:
+            try:
+                mode = input("\nChoose mode (1-3): ").strip()
+
+                if mode == '1':
+                    targets['mode'] = 'TE_only'
+                    target_te = float(input("Enter TE target efficiency (0-1): "))
+                    if 0 <= target_te <= 1:
+                        targets['target_te'] = target_te
+                        print(f"TE target set: {target_te:.3f}")
+                        break
+                    else:
+                        print("Target must be within 0-1.")
+
+                elif mode == '2':
+                    targets['mode'] = 'TM_only'
+                    target_tm = float(input("Enter TM target efficiency (0-1): "))
+                    if 0 <= target_tm <= 1:
+                        targets['target_tm'] = target_tm
+                        print(f"TM target set: {target_tm:.3f}")
+                        break
+                    else:
+                        print("Target must be within 0-1.")
+
+                elif mode == '3':
+                    targets['mode'] = 'dual'
+                    target_te = float(input("Enter TE target efficiency (0-1): "))
+                    target_tm = float(input("Enter TM target efficiency (0-1): "))
+
+                    if 0 <= target_te <= 1 and 0 <= target_tm <= 1:
+                        targets['target_te'] = target_te
+                        targets['target_tm'] = target_tm
+
+                        # Weight settings
+                        print("\nWeight settings (higher => more important):")
+                        te_weight = float(input("TE weight (default 1.0): ") or "1.0")
+                        tm_weight = float(input("TM weight (default 1.0): ") or "1.0")
+
+                        targets['te_weight'] = te_weight
+                        targets['tm_weight'] = tm_weight
+
+                        print(f"Dual-target settings:")
+                        print(f"   TE target: {target_te:.3f} (weight: {te_weight:.2f})")
+                        print(f"   TM target: {target_tm:.3f} (weight: {tm_weight:.2f})")
+                        break
+                    else:
+                        print("Targets must be within 0-1.")
+                else:
+                    print("Please enter 1, 2, or 3.")
+
+            except ValueError:
+                print("Please enter a valid number.")
+            except:
+                print("Input error. Please try again.")
+
+        return targets
+
+    def get_solution_requirements(self) -> Dict:
+        """Get solution requirements"""
+        print("\n" + "="*50)
+        print("Step 3: Set solution requirements")
+        print("="*50)
+
+        requirements = {}
+
+        while True:
+            try:
+                num_solutions = int(input("Enter number of solutions (recommended 5-15 for diversity): "))
+                if 1 <= num_solutions <= 30:
+                    requirements['num_solutions'] = num_solutions
+                    if num_solutions < 5:
+                        print("Consider generating at least 5 solutions for better diversity")
+                    break
+                else:
+                    print("Number of solutions must be within 1-30.")
+            except ValueError:
+                print("Please enter a valid integer.")
+
+        # Advanced settings
+        print("\nAdvanced settings (press Enter to accept defaults):")
+
+        try:
+            max_iter = input("Max iterations (default 1000): ").strip()
+            requirements['max_iterations'] = int(max_iter) if max_iter else 1000
+
+            lr = input("Learning rate (default 0.01): ").strip()
+            requirements['learning_rate'] = float(lr) if lr else 0.01
+
+            tolerance = input("Tolerance (default 0.001): ").strip()
+            requirements['tolerance'] = float(tolerance) if tolerance else 0.001
+
+        except ValueError:
+            print("Invalid advanced settings; using defaults")
+            requirements['max_iterations'] = 1000
+            requirements['learning_rate'] = 0.01
+            requirements['tolerance'] = 0.001
+
+        print(f"Requirements configured:")
+        print(f"   Solutions: {requirements['num_solutions']}")
+        print(f"   Max iterations: {requirements['max_iterations']}")
+        print(f"   Learning rate: {requirements['learning_rate']}")
+        print(f"   Tolerance: {requirements['tolerance']}")
+
+        return requirements
+
+    def optimize_parameters(self, constraints: Dict, targets: Dict, requirements: Dict) -> List[Dict]:
+        """Run parameter optimization"""
+        print("\n" + "="*50)
+        print("Step 4: Start optimization")
+        print("="*50)
+
+        results = []
+        num_solutions = requirements['num_solutions']
+
+        print(f"Running {num_solutions} independent optimizations...")
+
+        for i in range(num_solutions):
+            print(f"\n--- Optimization {i+1}/{num_solutions} ---")
+
+            result = self._single_optimization(constraints, targets, requirements, i+1)
+            if result:
+                results.append(result)
+
+                # Show current result
+                print(f"Optimization {i+1} completed:")
+                if targets['mode'] == 'TE_only':
+                    print(f"   TE efficiency: {result['te_efficiency']:.6f}")
+                elif targets['mode'] == 'TM_only':
+                    print(f"   TM efficiency: {result['tm_efficiency']:.6f}")
+                else:
+                    print(f"   TE efficiency: {result['te_efficiency']:.6f}")
+                    print(f"   TM efficiency: {result['tm_efficiency']:.6f}")
+
+                print(f"   Parameters: {result['optimized_params']}")
+
+        return results
+
+    def _single_optimization(self, constraints: Dict, targets: Dict, requirements: Dict, opt_id: int) -> Optional[Dict]:
+        """One optimization run"""
+        try:
+            # Diverse initialization strategy
+            initial_params = self._generate_diverse_initial_params(constraints, opt_id)
+
+            # Apply constraints
+            for param_name, fixed_value in constraints.items():
+                param_idx = self.param_names.index(param_name)
+                initial_params[0, param_idx] = fixed_value
+
+            # Scale params
+            params_scaled = torch.tensor(
+                self.scaler_X.transform(initial_params.cpu().numpy()),
+                dtype=torch.float32, device=self.device, requires_grad=True
+            )
+
+            # Optimizer with varied learning rate per run
+            base_lr = requirements['learning_rate']
+            lr_multiplier = 0.5 + 1.5 * torch.rand(1).item()  # 0.5-2.0x multiplier
+            actual_lr = base_lr * lr_multiplier
+            optimizer = optim.Adam([params_scaled], lr=actual_lr)
+
+            # LR scheduler
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=100)
+
+            print(f"   Learning rate: {actual_lr:.6f} (base: {base_lr})")
+
+            # History
+            history = {
+                'te_history': [],
+                'tm_history': [],
+                'loss_history': [],
+                'param_history': []
+            }
+
+            best_loss = float('inf')
+            best_params = None
+            best_te = None
+            best_tm = None
+
+            # Optimization loop
+            for iteration in range(requirements['max_iterations']):
+                optimizer.zero_grad()
+
+                # Forward
+                outputs = self.model(params_scaled)
+                te_pred = outputs[0, 0]
+                tm_pred = outputs[0, 1]
+
+                # Compute loss
+                loss = self._calculate_loss(te_pred, tm_pred, targets, constraints, params_scaled)
+
+                # Diversity penalty (encourage different solutions)
+                diversity_penalty = self._calculate_diversity_penalty(params_scaled, opt_id)
+                total_loss = loss + 0.01 * diversity_penalty  # small diversity weight
+
+                # Backprop
+                total_loss.backward()
+                optimizer.step()
+                scheduler.step(total_loss)  # scheduler
+
+                # Apply constraints (fixed parameters)
+                with torch.no_grad():
+                    current_params = torch.tensor(
+                        self.scaler_X.inverse_transform(params_scaled.detach().cpu().numpy()),
+                        dtype=torch.float32, device=self.device
+                    )
+
+                    # Re-apply fixed constraints
+                    for param_name, fixed_value in constraints.items():
+                        param_idx = self.param_names.index(param_name)
+                        current_params[0, param_idx] = fixed_value
+
+                    # Re-scale
+                    params_scaled.data = torch.tensor(
+                        self.scaler_X.transform(current_params.cpu().numpy()),
+                        dtype=torch.float32, device=self.device
+                    )
+
+                # Record history
+                current_params_numpy = current_params.squeeze().detach().cpu().numpy()
+                history['te_history'].append(te_pred.item())
+                history['tm_history'].append(tm_pred.item())
+                history['loss_history'].append(total_loss.item())
+                history['param_history'].append(current_params_numpy.copy())
+
+                # Update best
+                if total_loss.item() < best_loss:
+                    best_loss = total_loss.item()
+                    best_params = current_params_numpy.copy()
+                    best_te = te_pred.item()
+                    best_tm = tm_pred.item()
+
+                # Random perturbation (avoid local minima)
+                if iteration > 200 and iteration % 150 == 0:
+                    # Add small noise every 150 iterations
+                    with torch.no_grad():
+                        noise_strength = 0.05 * (1 - iteration / requirements['max_iterations'])  # decaying noise
+                        noise = torch.randn_like(params_scaled) * noise_strength
+                        params_scaled.data += noise
+                        print(f"   Added random perturbation (strength: {noise_strength:.4f})")
+
+                # Convergence check
+                if self._check_convergence(te_pred, tm_pred, targets, requirements['tolerance']):
+                    print(f"   Early convergence at iteration {iteration + 1}")
+                    break
+
+            # Compute errors
+            te_error, tm_error = self._calculate_errors(best_te, best_tm, targets)
+
+            return {
+                'optimization_id': opt_id,
+                'optimized_params': best_params,
+                'te_efficiency': best_te,
+                'tm_efficiency': best_tm,
+                'te_error': te_error,
+                'tm_error': tm_error,
+                'total_loss': best_loss,
+                'iterations': len(history['loss_history']),
+                'history': history,
+                'constraints': constraints,
+                'targets': targets
+            }
+
+        except Exception as e:
+            print(f"Optimization {opt_id} failed: {e}")
+            return None
+
+    def _calculate_loss(self, te_pred, tm_pred, targets, constraints, params_scaled):
+        """Compute loss function"""
+        loss = 0.0
+
+        if targets['mode'] == 'TE_only':
+            target_te = torch.tensor([targets['target_te']], dtype=torch.float32, device=self.device)
+            loss = (te_pred - target_te[0]) ** 2
+
+        elif targets['mode'] == 'TM_only':
+            target_tm = torch.tensor([targets['target_tm']], dtype=torch.float32, device=self.device)
+            loss = (tm_pred - target_tm[0]) ** 2
+
+        elif targets['mode'] == 'dual':
+            target_te = torch.tensor([targets['target_te']], dtype=torch.float32, device=self.device)
+            target_tm = torch.tensor([targets['target_tm']], dtype=torch.float32, device=self.device)
+
+            te_loss = (te_pred - target_te[0]) ** 2
+            tm_loss = (tm_pred - target_tm[0]) ** 2
+
+            loss = targets['te_weight'] * te_loss + targets['tm_weight'] * tm_loss
+
+        # Add parameter constraint penalty
+        params_original = torch.tensor(
+            self.scaler_X.inverse_transform(params_scaled.detach().cpu().numpy()),
+            dtype=torch.float32, device=self.device
+        )
+
+        constraint_loss = 0.0
+        for i in range(4):
+            if params_original[0, i] < self.param_min[i]:
+                constraint_loss += (self.param_min[i] - params_original[0, i]) ** 2
+            elif params_original[0, i] > self.param_max[i]:
+                constraint_loss += (params_original[0, i] - self.param_max[i]) ** 2
+
+        return loss + 0.1 * constraint_loss
+
+    def _check_convergence(self, te_pred, tm_pred, targets, tolerance):
+        """Check convergence condition"""
+        if targets['mode'] == 'TE_only':
+            return abs(te_pred.item() - targets['target_te']) < tolerance
+        elif targets['mode'] == 'TM_only':
+            return abs(tm_pred.item() - targets['target_tm']) < tolerance
+        elif targets['mode'] == 'dual':
+            te_converged = abs(te_pred.item() - targets['target_te']) < tolerance
+            tm_converged = abs(tm_pred.item() - targets['target_tm']) < tolerance
+            return te_converged and tm_converged
+
+        return False
+
+    def _calculate_errors(self, te_val, tm_val, targets):
+        """Compute absolute errors vs targets"""
+        te_error = 0.0
+        tm_error = 0.0
+
+        if targets['mode'] in ['TE_only', 'dual']:
+            te_error = abs(te_val - targets['target_te'])
+        if targets['mode'] in ['TM_only', 'dual']:
+            tm_error = abs(tm_val - targets['target_tm'])
+
+        return te_error, tm_error
+
+    def _generate_diverse_initial_params(self, constraints: Dict, opt_id: int) -> torch.Tensor:
+        """Generate diverse initial parameters"""
+        # Use different seeds to ensure diversity
+        torch.manual_seed(opt_id * 42 + int(time.time()) % 1000)
+
+        # Four initialization strategies
+        strategy = opt_id % 4
+
+        if strategy == 0:
+            # Strategy 1: Fully random
+            initial_params = torch.rand(1, 4, device=self.device) * (self.param_max - self.param_min) + self.param_min
+
+        elif strategy == 1:
+            # Strategy 2: Biased toward bounds
+            initial_params = torch.zeros(1, 4, device=self.device)
+            for i in range(4):
+                if torch.rand(1) > 0.5:
+                    # Near max
+                    initial_params[0, i] = self.param_min[i] + 0.8 * (self.param_max[i] - self.param_min[i]) + \
+                                         0.2 * torch.rand(1, device=self.device) * (self.param_max[i] - self.param_min[i])
+                else:
+                    # Near min
+                    initial_params[0, i] = self.param_min[i] + \
+                                         0.2 * torch.rand(1, device=self.device) * (self.param_max[i] - self.param_min[i])
+
+        elif strategy == 2:
+            # Strategy 3: Normal sampling around center
+            center = (self.param_max + self.param_min) / 2
+            std = (self.param_max - self.param_min) / 6  # 3-sigma rule
+            initial_params = torch.normal(center.unsqueeze(0), std.unsqueeze(0))
+            # Clamp to bounds
+            initial_params = torch.clamp(initial_params, self.param_min, self.param_max)
+
+        else:  # strategy == 3
+            # Strategy 4: Latin Hypercube-like sampling
+            initial_params = torch.zeros(1, 4, device=self.device)
+            for i in range(4):
+                # Divide into segments and sample within selected one
+                num_segments = 10
+                segment = (opt_id + i) % num_segments
+                segment_start = segment / num_segments
+                segment_end = (segment + 1) / num_segments
+                segment_random = segment_start + torch.rand(1, device=self.device) * (segment_end - segment_start)
+                initial_params[0, i] = self.param_min[i] + segment_random * (self.param_max[i] - self.param_min[i])
+
+        print(f"   Init strategy {strategy + 1}: {['Random', 'Boundary-biased', 'Normal', 'Latin hypercube'][strategy]}")
+
+        return initial_params
+
+    def _calculate_diversity_penalty(self, params_scaled: torch.Tensor, opt_id: int) -> torch.Tensor:
+        """Diversity penalty to encourage distinct solutions"""
+        # Define some attractor points to avoid mode collapse
+        attractors = [
+            torch.tensor([0.2, 0.2, 0.2, 0.2], device=self.device),  # low region
+            torch.tensor([0.8, 0.8, 0.8, 0.8], device=self.device),  # high region
+            torch.tensor([0.5, 0.2, 0.8, 0.5], device=self.device),  # mixed region
+            torch.tensor([0.3, 0.7, 0.4, 0.9], device=self.device),  # another mixed region
+        ]
+
+        # Pick target attractor by optimization id
+        target_attractor = attractors[opt_id % len(attractors)]
+
+        # Normalize current params to [0,1]
+        params_normalized = (params_scaled - params_scaled.min()) / (params_scaled.max() - params_scaled.min() + 1e-8)
+
+        # Distance to target attractor
+        diversity_loss = torch.sum((params_normalized.squeeze() - target_attractor) ** 2)
+
+        return diversity_loss
+
+    def display_results(self, results: List[Dict], targets: Dict):
+        """Display optimization results"""
+        print("\n" + "="*50)
+        print("Optimization Summary")
+        print("="*50)
+
+        if not results:
+            print("No valid optimization results found")
+            return
+
+        print(f"Found {len(results)} solutions:\n")
+
+        # Sort by performance
+        if targets['mode'] == 'TE_only':
+            results.sort(key=lambda x: x['te_error'])
+        elif targets['mode'] == 'TM_only':
+            results.sort(key=lambda x: x['tm_error'])
+        else:
+            results.sort(key=lambda x: x['te_error'] + x['tm_error'])
+
+        # Show all results
+        for i, result in enumerate(results):
+            print(f"Solution {i+1} (opt ID: {result['optimization_id']}):")
+            print(f"   Parameters: {result['optimized_params']}")
+
+            if targets['mode'] in ['TE_only', 'dual']:
+                print(f"   TE efficiency: {result['te_efficiency']:.6f} (error: {result['te_error']:.6f})")
+            if targets['mode'] in ['TM_only', 'dual']:
+                print(f"   TM efficiency: {result['tm_efficiency']:.6f} (error: {result['tm_error']:.6f})")
+
+            print(f"   Iterations: {result['iterations']}")
+
+            # Show constraints
+            if result['constraints']:
+                constrained_params = []
+                for param_name, value in result['constraints'].items():
+                    constrained_params.append(f"{param_name}={value:.4f}")
+                print(f"   Constraints: {', '.join(constrained_params)}")
+
+            print()
+
+        # Show best solution details
+        best_result = results[0]
+        print(f"Recommended solution (best performance):")
+        print(f"   Input parameters:")
+        for i, param_name in enumerate(self.param_names):
+            print(f"     {param_name}: {best_result['optimized_params'][i]:.6f}")
+
+        # Diversity stats
+        self._display_diversity_statistics(results)
+
+        return results
+
+    def _display_diversity_statistics(self, results: List[Dict]):
+        """Display diversity statistics"""
+        print(f"\nParameter diversity analysis:")
+
+        if len(results) < 2:
+            print("   Not enough solutions to analyze diversity")
+            return
+
+        # Collect all params
+        all_params = np.array([r['optimized_params'] for r in results])
+
+        print(f"   Parameter variation:")
+        for i, param_name in enumerate(self.param_names):
+            param_values = all_params[:, i]
+            param_std = np.std(param_values)
+            param_range = np.max(param_values) - np.min(param_values)
+            total_range = self.param_max[i].item() - self.param_min[i].item()
+            coverage = (param_range / total_range) * 100
+
+            print(f"     {param_name}: std={param_std:.6f}, coverage={coverage:.1f}%")
+
+        # Average pairwise distance
+        distances = []
+        for i in range(len(results)):
+            for j in range(i+1, len(results)):
+                dist = np.linalg.norm(all_params[i] - all_params[j])
+                distances.append(dist)
+
+        if distances:
+            avg_distance = np.mean(distances)
+            print(f"   Average pairwise distance: {avg_distance:.6f}")
+
+            if avg_distance < 0.1:
+                print("   Warning: low diversity; consider increasing solutions or tuning optimization settings")
+            else:
+                print("   Diversity looks good")
+
+    def _build_output_path(self, prefix: str, targets: Dict, constraints: Dict, num_solutions: int, timestamp: str, ext: str) -> str:
+        """Build an output file path with descriptive filename (length-safe for Windows)."""
+        filename_parts = [prefix]
+        # mode
+        filename_parts.append(targets['mode'])
+        # target efficiencies
+        if targets['mode'] in ['TE_only', 'dual']:
+            filename_parts.append(f"TE{targets['target_te']:.3f}")
+        if targets['mode'] in ['TM_only', 'dual']:
+            filename_parts.append(f"TM{targets['target_tm']:.3f}")
+        # constraints
+        if constraints:
+            constraint_parts = [f"{k}{v:.3f}" for k, v in constraints.items()]
+            filename_parts.append("fixed_" + "_".join(constraint_parts))
+        else:
+            filename_parts.append("no_constraints")
+        # solutions and timestamp
+        filename_parts.append(f"{num_solutions}solutions")
+        filename_parts.append(timestamp)
+
+        filename_base = "_".join(filename_parts)
+        if len(filename_base) > 200:
+            filename_base = f"{prefix}_{targets['mode']}_{num_solutions}solutions_{timestamp}"
+        filename = f"{filename_base}.{ext}"
+        return os.path.join(self.save_dir, filename)
+
+    def save_results(self, results: List[Dict], constraints: Dict, targets: Dict, requirements: Dict):
+        """Save results to CSV file"""
+        print("\nSaving results...")
+
+        # Create summary DataFrame
+        summary_data = []
+        for result in results:
+            row = {
+                'optimization_id': result['optimization_id'],
+                'lambda': result['optimized_params'][0],
+                'n': result['optimized_params'][1],
+                'alpha': result['optimized_params'][2],
+                'f': result['optimized_params'][3],
+                'te_efficiency': result['te_efficiency'],
+                'tm_efficiency': result['tm_efficiency'],
+                'te_error': result['te_error'],
+                'tm_error': result['tm_error'],
+                'total_loss': result['total_loss'],
+                'iterations': result['iterations']
+            }
+
+            # Add target info
+            if targets['mode'] in ['TE_only', 'dual']:
+                row['target_te'] = targets['target_te']
+            if targets['mode'] in ['TM_only', 'dual']:
+                row['target_tm'] = targets['target_tm']
+
+            # Add constraints info
+            for param_name in self.param_names:
+                if param_name in constraints:
+                    row[f'fixed_{param_name}'] = constraints[param_name]
+                else:
+                    row[f'fixed_{param_name}'] = None
+
+            summary_data.append(row)
+
+        df = pd.DataFrame(summary_data)
+
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        full_path = self._build_output_path(
+            prefix='interactive_optimization_results',
+            targets=targets,
+            constraints=constraints,
+            num_solutions=len(results),
+            timestamp=timestamp,
+            ext='csv'
+        )
+        df.to_csv(full_path, index=False, encoding='utf-8-sig')
+
+        print(f"Results saved to: {full_path}")
+
+        return full_path
+
+    def visualize_results(self, results: List[Dict], targets: Dict):
+        """Visualize optimization results"""
+        if not results:
+            return
+
+        print("\nGenerating plots...")
+
+        # Select best result to visualize
+        best_result = min(results, key=lambda x: x.get('te_error', 0) + x.get('tm_error', 0))
+
+        # Decide layout by number of unfixed parameters
+        unfixed_params = [name for name in self.param_names if name not in best_result['constraints']]
+        num_unfixed = len(unfixed_params)
+
+        if num_unfixed <= 2:
+            # Fewer unfixed params -> 2x3 layout
+            fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        else:
+            # More unfixed params -> 3x3 layout
+            fig, axes = plt.subplots(3, 3, figsize=(20, 12))
+
+        fig.suptitle('Parameter Optimization Analysis', fontsize=16, fontweight='normal', y=0.98)
+        axes = axes.flatten() 
+
+        # 1. Efficiency Optimization History
+        ax1 = axes[0]
+        if targets['mode'] in ['TE_only', 'dual']:
+            ax1.plot(best_result['history']['te_history'], label='TE', linewidth=1.5, color='#2E86AB')
+            ax1.axhline(y=targets.get('target_te', 0), color='#C73E1D', linestyle='--', alpha=0.8, linewidth=1.5, label='TE Target')
+        if targets['mode'] in ['TM_only', 'dual']:
+            ax1.plot(best_result['history']['tm_history'], label='TM', linewidth=1.5, color='#F18F01')
+            ax1.axhline(y=targets.get('target_tm', 0), color='#A23B72', linestyle='--', alpha=0.8, linewidth=1.5, label='TM Target')
+
+        ax1.set_xlabel('Iteration')
+        ax1.set_ylabel('Diffraction Efficiency')
+        ax1.set_title('(a) Efficiency Evolution')
+        ax1.legend(frameon=False)
+        ax1.set_ylim(bottom=0)
+
+        # 2. History of the loss function
+        ax2 = axes[1]
+        ax2.semilogy(best_result['history']['loss_history'], linewidth=1.5, color='#7209B7')
+        ax2.set_xlabel('Iteration')
+        ax2.set_ylabel('Loss Function')
+        ax2.set_title('(b) Loss Evolution')
+        ax2.set_ylim(bottom=1e-6)
+
+    # 3-6. Per-parameter optimization trajectories
+        colors = ['#2E86AB', '#F18F01', '#A23B72', '#7209B7'] 
+        param_plot_idx = 2  
+        subplot_labels = ['(c)', '(d)', '(e)', '(f)', '(g)', '(h)', '(i)']
+
+        for i, param_name in enumerate(self.param_names):
+            if param_plot_idx >= len(axes):
+                break
+
+            ax_param = axes[param_plot_idx]
+            param_trajectory = [p[i] for p in best_result['history']['param_history']]
+            label_idx = param_plot_idx - 2
+
+            if param_name in best_result['constraints']:
+                # Fixed parameter: horizontal line
+                fixed_value = best_result['constraints'][param_name]
+                ax_param.axhline(y=fixed_value, color=colors[i], linewidth=2.5, alpha=0.9)
+                ax_param.set_title(f'{subplot_labels[label_idx]} {param_name.capitalize()} (Fixed)')
+                ax_param.text(0.5, 0.5, f'{fixed_value:.3f}',
+                            transform=ax_param.transAxes, ha='center', va='center',
+                            fontsize=14, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray", alpha=0.6, edgecolor='none'))
+                ax_param.set_ylim(fixed_value - 0.1 * abs(fixed_value), fixed_value + 0.1 * abs(fixed_value))
+            else:
+                # Unfixed parameter: trajectory
+                ax_param.plot(param_trajectory, color=colors[i], linewidth=1.5)
+                ax_param.set_title(f'{subplot_labels[label_idx]} {param_name.capitalize()} Evolution')
+
+                # Start and end markers
+                ax_param.scatter(0, param_trajectory[0], color=colors[i], s=40, marker='o',
+                               alpha=0.9, zorder=5, edgecolors='white', linewidth=0.5)
+                ax_param.scatter(len(param_trajectory)-1, param_trajectory[-1], color=colors[i],
+                               s=40, marker='s', alpha=0.9, zorder=5, edgecolors='white', linewidth=0.5)
+
+                # Show parameter bounds
+                param_min_val = self.param_min[i].item()
+                param_max_val = self.param_max[i].item()
+                ax_param.axhline(y=param_min_val, color='gray', linestyle=':', alpha=0.4, linewidth=0.8)
+                ax_param.axhline(y=param_max_val, color='gray', linestyle=':', alpha=0.4, linewidth=0.8)
+
+            ax_param.set_xlabel('Iteration')
+            ax_param.set_ylabel(f'{param_name.capitalize()}')
+
+            param_plot_idx += 1
+
+        # 7. Solution distribution (all results)
+        if param_plot_idx < len(axes):
+            ax_dist = axes[param_plot_idx]
+            param_plot_idx += 1
+            label_idx = param_plot_idx - 3
+
+            if targets['mode'] == 'dual':
+                te_vals = [r['te_efficiency'] for r in results]
+                tm_vals = [r['tm_efficiency'] for r in results]
+                scatter = ax_dist.scatter(te_vals, tm_vals, s=60, alpha=0.7, c=range(len(results)),
+                                        cmap='viridis', edgecolors='white', linewidth=0.5)
+                ax_dist.scatter(targets['target_te'], targets['target_tm'], s=100, color='#C73E1D',
+                              marker='X', label='Target', zorder=10, edgecolors='white', linewidth=1)
+                ax_dist.set_xlabel('TE Efficiency')
+                ax_dist.set_ylabel('TM Efficiency')
+                ax_dist.set_title(f'{subplot_labels[label_idx]} Solution Distribution')
+                cbar = plt.colorbar(scatter, ax=ax_dist)
+                cbar.set_label('Solution ID', rotation=270, labelpad=15)
+            else:
+                # Parameter vs efficiency — pick first unfixed parameter
+                param_idx = 0
+                for i, param_name in enumerate(self.param_names):
+                    if param_name not in best_result['constraints']:
+                        param_idx = i
+                        break
+
+                param_vals = [r['optimized_params'][param_idx] for r in results]
+                if targets['mode'] == 'TE_only':
+                    eff_vals = [r['te_efficiency'] for r in results]
+                    scatter = ax_dist.scatter(param_vals, eff_vals, s=60, alpha=0.7, c=range(len(results)),
+                                            cmap='viridis', edgecolors='white', linewidth=0.5)
+                    ax_dist.set_ylabel('TE Efficiency')
+                else:
+                    eff_vals = [r['tm_efficiency'] for r in results]
+                    scatter = ax_dist.scatter(param_vals, eff_vals, s=60, alpha=0.7, c=range(len(results)),
+                                            cmap='viridis', edgecolors='white', linewidth=0.5)
+                    ax_dist.set_ylabel('TM Efficiency')
+
+                ax_dist.set_xlabel(f'{self.param_names[param_idx].capitalize()}')
+                ax_dist.set_title(f'{subplot_labels[label_idx]} Parameter vs Efficiency')
+                cbar = plt.colorbar(scatter, ax=ax_dist)
+                cbar.set_label('Solution ID', rotation=270, labelpad=15)
+
+            ax_dist.legend(frameon=False)
+
+        # 8. Parameter diversity heatmap (if multiple solutions)
+        if param_plot_idx < len(axes) and len(results) > 1:
+            ax_heatmap = axes[param_plot_idx]
+            param_plot_idx += 1
+            label_idx = param_plot_idx - 3
+
+            # Parameter matrix
+            param_matrix = np.array([r['optimized_params'] for r in results])
+
+            # Normalize params to [0,1] for comparison
+            param_normalized = np.zeros_like(param_matrix)
+            for i in range(4):
+                param_min_val = self.param_min[i].item()
+                param_max_val = self.param_max[i].item()
+                param_normalized[:, i] = (param_matrix[:, i] - param_min_val) / (param_max_val - param_min_val)
+
+            im = ax_heatmap.imshow(param_normalized.T, aspect='auto', cmap='RdYlBu_r', vmin=0, vmax=1)
+            ax_heatmap.set_xlabel('Solution ID')
+            ax_heatmap.set_ylabel('Parameters')
+            ax_heatmap.set_title(f'{subplot_labels[label_idx]} Parameter Diversity')
+            ax_heatmap.set_yticks(range(4))
+            ax_heatmap.set_yticklabels([name.capitalize() for name in self.param_names])
+            cbar = plt.colorbar(im, ax=ax_heatmap)
+            cbar.set_label('Normalized Value', rotation=270, labelpad=15)
+
+        # Hide unused subplots
+        for idx in range(param_plot_idx, len(axes)):
+            axes[idx].set_visible(False)
+
+        # Aesthetic adjustments
+        for ax in axes:
+            if ax.get_visible():
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+                ax.spines['left'].set_linewidth(0.5)
+                ax.spines['bottom'].set_linewidth(0.5)
+                ax.tick_params(which='both', width=0.5)
+                ax.grid(True, alpha=0.3, linewidth=0.5)
+
+        plt.tight_layout(pad=2.0)
+
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        full_path = self._build_output_path(
+            prefix='interactive_optimization',
+            targets=targets,
+            constraints=best_result['constraints'],
+            num_solutions=len(results),
+            timestamp=timestamp,
+            ext='png'
+        )
+
+        plt.savefig(full_path, dpi=300, bbox_inches='tight')
+        print(f"Figure saved to: {full_path}")
+
+        plt.show()
+
+    def run(self):
+        """Run the interactive optimization system"""
+        try:
+            # Load model and data
+            self.load_model_and_data()
+
+            # Get user inputs
+            constraints = self.get_user_constraints()
+            targets = self.get_optimization_targets()
+            requirements = self.get_solution_requirements()
+
+            # Show summary
+            print("\n" + "="*50)
+            print("Optimization settings summary")
+            print("="*50)
+
+            if constraints:
+                print("Fixed parameters:")
+                for param, value in constraints.items():
+                    print(f"  {param}: {value:.4f}")
+            else:
+                print("Fixed parameters: none")
+
+            print(f"Mode: {targets['mode']}")
+            if targets['mode'] in ['TE_only', 'dual']:
+                print(f"TE target: {targets['target_te']:.3f}")
+            if targets['mode'] in ['TM_only', 'dual']:
+                print(f"TM target: {targets['target_tm']:.3f}")
+
+            print(f"Number of solutions: {requirements['num_solutions']}")
+
+            # Confirm start
+            confirm = input("\nStart optimization? (y/n): ").strip().lower()
+            if confirm not in ['y', 'yes']:
+                print("Optimization cancelled")
+                return
+
+            # Run optimization
+            results = self.optimize_parameters(constraints, targets, requirements)
+
+            # Show results
+            final_results = self.display_results(results, targets)
+
+            # Save and visualize
+            if final_results:
+                save_choice = input("\nSave results to CSV? (y/n): ").strip().lower()
+                if save_choice in ['y', 'yes']:
+                    self.save_results(final_results, constraints, targets, requirements)
+
+                viz_choice = input("Generate plots? (y/n): ").strip().lower()
+                if viz_choice in ['y', 'yes']:
+                    self.visualize_results(final_results, targets)
+
+            print("\nInteractive optimization completed!")
+
+        except KeyboardInterrupt:
+            print("\nInterrupted by user")
+        except Exception as e:
+            print(f"\nSystem error: {e}")
+            import traceback
+            traceback.print_exc()
+
+def main():
+    """Main entry"""
+    system = InteractiveOptimizationSystem()
+    system.run()
+
+if __name__ == "__main__":
+    main()
