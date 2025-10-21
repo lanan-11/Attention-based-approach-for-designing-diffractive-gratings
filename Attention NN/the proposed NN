@@ -1,0 +1,128 @@
+import torch
+import torch.nn as nn
+
+
+class MultiTokenDualOutputPhysicsInformedAttentionNet(nn.Module):
+    """
+    Multi-token dual-output attention network.
+
+    - Each scalar input parameter is embedded as an independent token (key difference from single-token models).
+    - A small stack of TransformerEncoderLayers processes the token sequence.
+    - Mean pooling aggregates token features into a single vector.
+    - Two MLP heads produce dual outputs (TE and TM diffraction efficiencies).
+
+    The attention weights used for visualization are computed heuristically by
+    cosine similarity of normalized token embeddings per head slice. This keeps
+    the forward pass simple while enabling meaningful attention heatmaps.
+    """
+
+    def __init__(self, input_dim: int, d_model: int = 128, num_heads: int = 2, num_layers: int = 1):
+        super().__init__()
+        self.input_dim = input_dim
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+
+        # Token embedding per scalar parameter: [B, 1] -> [B, d_model]
+        self.token_embeddings = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(1, d_model),
+                nn.LayerNorm(d_model),
+                nn.ReLU(),
+            ) for _ in range(input_dim)
+        ])
+
+        # Lightweight Transformer encoder stack
+        self.transformer_layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=num_heads,
+                dim_feedforward=256,
+                dropout=0.1,
+                batch_first=True,
+            ) for _ in range(num_layers)
+        ])
+
+        # Dual-output heads
+        self.te_output = nn.Sequential(
+            nn.Linear(d_model, 128),
+            nn.ReLU(),
+            nn.Linear(128, 512),
+            nn.ReLU(),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1),
+        )
+
+        self.tm_output = nn.Sequential(
+            nn.Linear(d_model, 128),
+            nn.ReLU(),
+            nn.Linear(128, 512),
+            nn.ReLU(),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1),
+        )
+
+    def forward(self, x: torch.Tensor, return_attention: bool = False):
+        """
+        Args:
+            x: [batch_size, input_dim]
+            return_attention: whether to return heuristic attention weights.
+
+        Returns:
+            If return_attention is False:
+                outputs: [batch_size, 2]
+            If True:
+                outputs: [batch_size, 2]
+                attention_weights: List[Tensor] with shape [B, num_heads, seq_len, seq_len] per layer
+        """
+        batch_size = x.size(0)
+
+        # Embed each scalar parameter into a token
+        tokens = []
+        for i in range(self.input_dim):
+            param = x[:, i:i + 1]  # [B, 1]
+            token = self.token_embeddings[i](param)  # [B, d_model]
+            tokens.append(token)
+
+        # [B, seq_len=input_dim, d_model]
+        token_sequence = torch.stack(tokens, dim=1)
+
+        attention_weights = []
+        encoded_tokens = token_sequence
+
+        if return_attention:
+            # Heuristic per-head attention via cosine similarity over head slices
+            d_k = self.d_model // self.num_heads
+            for layer in self.transformer_layers:
+                multi_head_attention = []
+
+                for head in range(self.num_heads):
+                    start_dim = head * d_k
+                    end_dim = (head + 1) * d_k
+                    head_tokens = encoded_tokens[:, :, start_dim:end_dim]  # [B, seq, d_k]
+
+                    norm_tokens = torch.nn.functional.normalize(head_tokens, dim=-1)
+                    head_attention = torch.matmul(norm_tokens, norm_tokens.transpose(-2, -1))
+                    head_attention = torch.softmax(head_attention, dim=-1)
+                    multi_head_attention.append(head_attention)
+
+                layer_attention = torch.stack(multi_head_attention, dim=1)  # [B, H, S, S]
+                attention_weights.append(layer_attention.detach().cpu())
+
+                encoded_tokens = layer(encoded_tokens)
+        else:
+            for layer in self.transformer_layers:
+                encoded_tokens = layer(encoded_tokens)
+
+        # Mean pool tokens -> feature vector
+        pooled = encoded_tokens.mean(dim=1)  # [B, d_model]
+
+        te_out = self.te_output(pooled)
+        tm_out = self.tm_output(pooled)
+        outputs = torch.cat([te_out, tm_out], dim=1)  # [B, 2]
+
+        if return_attention:
+            return outputs, attention_weights
+        return outputs
