@@ -1,0 +1,277 @@
+import os
+import torch
+import matplotlib
+
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+
+def visualize_attention_weights(model, X_data, y_data, scaler_X, fig_save_path: str, num_samples: int = 3):
+    """Visualize attention weights for randomly selected samples.
+
+    Saves dual-head and averaged attention heatmaps per layer.
+    """
+    model.eval()
+    os.makedirs(fig_save_path, exist_ok=True)
+
+    indices = torch.randperm(X_data.size(0))[:num_samples]
+    param_names = ['n', 'lambda', 'alpha', 'h']
+
+    with torch.no_grad():
+        for idx, sample_idx in enumerate(indices):
+            sample_input = X_data[sample_idx:sample_idx + 1]
+            sample_output = y_data[sample_idx:sample_idx + 1]
+
+            outputs, attention_weights = model(sample_input, return_attention=True)
+
+            original_params = scaler_X.inverse_transform(sample_input.cpu().numpy())
+            te_pred, tm_pred = outputs[0, 0].item(), outputs[0, 1].item()
+            te_true, tm_true = sample_output[0, 0].item(), sample_output[0, 1].item()
+
+            print(f"\n--- Sample {idx + 1} (index {sample_idx.item()}) ---")
+            print(f"Input parameters: {original_params[0]}")
+            print(f"Ground truth: TE={te_true:.4f}, TM={tm_true:.4f}")
+            print(f"Prediction: TE={te_pred:.4f}, TM={tm_pred:.4f}")
+
+            for layer_idx, attn_weight in enumerate(attention_weights):
+                if attn_weight.dim() == 4 and attn_weight.shape[1] >= 2:
+                    fig, axes = plt.subplots(1, 3, figsize=(24, 8))
+
+                    head1_attention = attn_weight[0, 0]
+                    im1 = axes[0].imshow(head1_attention.numpy(), cmap='Blues', aspect='equal')
+                    axes[0].set_xticks(range(len(param_names)))
+                    axes[0].set_yticks(range(len(param_names)))
+                    axes[0].set_xticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+                    axes[0].set_yticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+                    axes[0].set_title(f'Head 1 Attention (Layer {layer_idx + 1})', fontsize=36, fontweight='bold',
+                                      fontfamily='Times New Roman')
+                    for i in range(len(param_names)):
+                        for j in range(len(param_names)):
+                            axes[0].text(j, i, f'{head1_attention[i, j]:.3f}', ha='center', va='center',
+                                         color='black' if head1_attention[i, j] < 0.5 else 'white', fontsize=20,
+                                         fontweight='bold')
+                    cbar1 = plt.colorbar(im1, ax=axes[0], shrink=0.8)
+                    cbar1.ax.tick_params(labelsize=28)
+                    for label in cbar1.ax.get_yticklabels():
+                        label.set_fontweight('bold')
+
+                    head2_attention = attn_weight[0, 1]
+                    im2 = axes[1].imshow(head2_attention.numpy(), cmap='Greens', aspect='equal')
+                    axes[1].set_xticks(range(len(param_names)))
+                    axes[1].set_yticks(range(len(param_names)))
+                    axes[1].set_xticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+                    axes[1].set_yticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+                    axes[1].set_title(f'Head 2 Attention (Layer {layer_idx + 1})', fontsize=36, fontweight='bold',
+                                      fontfamily='Times New Roman')
+                    for i in range(len(param_names)):
+                        for j in range(len(param_names)):
+                            axes[1].text(j, i, f'{head2_attention[i, j]:.3f}', ha='center', va='center',
+                                         color='black' if head2_attention[i, j] < 0.5 else 'white', fontsize=20,
+                                         fontweight='bold')
+                    cbar2 = plt.colorbar(im2, ax=axes[1], shrink=0.8)
+                    cbar2.ax.tick_params(labelsize=28)
+                    for label in cbar2.ax.get_yticklabels():
+                        label.set_fontweight('bold')
+
+                    avg_attention = attn_weight[0].mean(dim=0)
+                    im3 = axes[2].imshow(avg_attention.numpy(), cmap='Purples', aspect='equal')
+                    axes[2].set_xticks(range(len(param_names)))
+                    axes[2].set_yticks(range(len(param_names)))
+                    axes[2].set_xticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+                    axes[2].set_yticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+                    axes[2].set_title(f'Average Attention (Layer {layer_idx + 1})', fontsize=36, fontweight='bold',
+                                      fontfamily='Times New Roman')
+                    for i in range(len(param_names)):
+                        for j in range(len(param_names)):
+                            axes[2].text(j, i, f'{avg_attention[i, j]:.3f}', ha='center', va='center',
+                                         color='black' if avg_attention[i, j] < 0.5 else 'white', fontsize=20,
+                                         fontweight='bold')
+                    cbar3 = plt.colorbar(im3, ax=axes[2], shrink=0.8)
+                    cbar3.ax.tick_params(labelsize=28)
+                    for label in cbar3.ax.get_yticklabels():
+                        label.set_fontweight('bold')
+
+                    plt.suptitle(
+                        f'Multi-Token Dual-Head Attention Weights - Sample {idx + 1} - Layer {layer_idx + 1}\n'
+                        f'Input Parameters: n={original_params[0][0]:.3f}, '
+                        f'lambda={original_params[0][1]:.3f}, alpha={original_params[0][2]:.3f}, '
+                        f'h={original_params[0][3]:.3f}',
+                        fontsize=40, fontweight='bold', fontfamily='Times New Roman', y=0.98,
+                    )
+                    plt.tight_layout(rect=[0, 0, 1, 0.92])
+
+                    fig_name = f'multi_token_attention_weights_sample{idx + 1}_layer{layer_idx + 1}'
+                    plt.savefig(os.path.join(fig_save_path, f'{fig_name}.pdf'), format='pdf', bbox_inches='tight',
+                                pad_inches=0.1)
+                    plt.savefig(os.path.join(fig_save_path, f'{fig_name}.png'), format='png', bbox_inches='tight',
+                                pad_inches=0.1)
+                    print(f'Attention weight figures saved to: {fig_save_path}')
+                    plt.close()
+                else:
+                    print(f"Warning: unexpected attention tensor shape: {attn_weight.shape}")
+
+
+def compute_average_attention_weights(model, X_data, max_samples: int = 5000):
+    """Compute mean/std attention weights across many samples."""
+    model.eval()
+    num_samples = min(max_samples, X_data.size(0))
+    indices = torch.randperm(X_data.size(0))[:num_samples]
+
+    all_head1_weights = []
+    all_head2_weights = []
+
+    with torch.no_grad():
+        for idx, sample_idx in enumerate(indices):
+            sample_input = X_data[sample_idx:sample_idx + 1]
+            _, attention_weights = model(sample_input, return_attention=True)
+
+            for layer_idx, attn_weight in enumerate(attention_weights):
+                if attn_weight.dim() == 4 and attn_weight.shape[1] >= 2:
+                    head1_attention = attn_weight[0, 0].cpu()
+                    head2_attention = attn_weight[0, 1].cpu()
+
+                    if idx == 0:
+                        all_head1_weights.append([])
+                        all_head2_weights.append([])
+
+                    all_head1_weights[layer_idx].append(head1_attention)
+                    all_head2_weights[layer_idx].append(head2_attention)
+
+    results = []
+    num_layers = len(all_head1_weights)
+    for layer_idx in range(num_layers):
+        head1_stack = torch.stack(all_head1_weights[layer_idx])
+        head1_mean = head1_stack.mean(dim=0)
+        head1_std = head1_stack.std(dim=0)
+
+        head2_stack = torch.stack(all_head2_weights[layer_idx])
+        head2_mean = head2_stack.mean(dim=0)
+        head2_std = head2_stack.std(dim=0)
+
+        dual_mean = (head1_mean + head2_mean) / 2
+        dual_std = torch.sqrt((head1_std ** 2 + head2_std ** 2) / 2)
+
+        results.append({
+            'head1_mean': head1_mean,
+            'head1_std': head1_std,
+            'head2_mean': head2_mean,
+            'head2_std': head2_std,
+            'dual_head_mean': dual_mean,
+            'dual_head_std': dual_std,
+        })
+
+    return results, ['n', 'lambda', 'alpha', 'h'], num_samples
+
+
+def visualize_average_attention_weights(results, param_names, num_samples: int, fig_save_path: str):
+    os.makedirs(fig_save_path, exist_ok=True)
+    import matplotlib.pyplot as plt
+    for layer_idx, layer_results in enumerate(results):
+        fig, axes = plt.subplots(2, 3, figsize=(24, 16))
+
+        # Means
+        head1_mean = layer_results['head1_mean']
+        im1 = axes[0, 0].imshow(head1_mean.numpy(), cmap='Blues', aspect='equal', vmin=0, vmax=1)
+        axes[0, 0].set_xticks(range(len(param_names)))
+        axes[0, 0].set_yticks(range(len(param_names)))
+        axes[0, 0].set_xticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+        axes[0, 0].set_yticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+        axes[0, 0].set_title('Head 1 Average Attention', fontsize=36, fontweight='bold', fontfamily='Times New Roman')
+        for i in range(len(param_names)):
+            for j in range(len(param_names)):
+                v = head1_mean[i, j].item()
+                axes[0, 0].text(j, i, f'{v:.3f}', ha='center', va='center',
+                                 color='white' if v > 0.5 else 'black', fontsize=20, fontweight='bold')
+        cbar1 = fig.colorbar(im1, ax=axes[0, 0], shrink=0.8)
+        cbar1.ax.tick_params(labelsize=24)
+
+        head2_mean = layer_results['head2_mean']
+        im2 = axes[0, 1].imshow(head2_mean.numpy(), cmap='Greens', aspect='equal', vmin=0, vmax=1)
+        axes[0, 1].set_xticks(range(len(param_names)))
+        axes[0, 1].set_yticks(range(len(param_names)))
+        axes[0, 1].set_xticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+        axes[0, 1].set_yticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+        axes[0, 1].set_title('Head 2 Average Attention', fontsize=36, fontweight='bold', fontfamily='Times New Roman')
+        for i in range(len(param_names)):
+            for j in range(len(param_names)):
+                v = head2_mean[i, j].item()
+                axes[0, 1].text(j, i, f'{v:.3f}', ha='center', va='center',
+                                 color='white' if v > 0.5 else 'black', fontsize=20, fontweight='bold')
+        cbar2 = fig.colorbar(im2, ax=axes[0, 1], shrink=0.8)
+        cbar2.ax.tick_params(labelsize=24)
+
+        dual_mean = layer_results['dual_head_mean']
+        im3 = axes[0, 2].imshow(dual_mean.numpy(), cmap='Purples', aspect='equal', vmin=0, vmax=1)
+        axes[0, 2].set_xticks(range(len(param_names)))
+        axes[0, 2].set_yticks(range(len(param_names)))
+        axes[0, 2].set_xticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+        axes[0, 2].set_yticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+        axes[0, 2].set_title('Dual-Head Average Attention', fontsize=36, fontweight='bold', fontfamily='Times New Roman')
+        for i in range(len(param_names)):
+            for j in range(len(param_names)):
+                v = dual_mean[i, j].item()
+                axes[0, 2].text(j, i, f'{v:.3f}', ha='center', va='center',
+                                 color='white' if v > 0.5 else 'black', fontsize=20, fontweight='bold')
+        cbar3 = fig.colorbar(im3, ax=axes[0, 2], shrink=0.8)
+        cbar3.ax.tick_params(labelsize=24)
+
+        # STDs
+        head1_std = layer_results['head1_std']
+        std_max = max(head1_std.max().item(), layer_results['head2_std'].max().item(),
+                      layer_results['dual_head_std'].max().item())
+        im4 = axes[1, 0].imshow(head1_std.numpy(), cmap='Reds', aspect='equal', vmin=0, vmax=std_max)
+        axes[1, 0].set_xticks(range(len(param_names)))
+        axes[1, 0].set_yticks(range(len(param_names)))
+        axes[1, 0].set_xticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+        axes[1, 0].set_yticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+        axes[1, 0].set_title('Head 1 Standard Deviation', fontsize=36, fontweight='bold', fontfamily='Times New Roman')
+        for i in range(len(param_names)):
+            for j in range(len(param_names)):
+                v = head1_std[i, j].item()
+                axes[1, 0].text(j, i, f'{v:.3f}', ha='center', va='center',
+                                 color='white' if v > std_max / 2 else 'black', fontsize=20, fontweight='bold')
+        cbar4 = fig.colorbar(im4, ax=axes[1, 0], shrink=0.8)
+        cbar4.ax.tick_params(labelsize=24)
+
+        head2_std = layer_results['head2_std']
+        im5 = axes[1, 1].imshow(head2_std.numpy(), cmap='Reds', aspect='equal', vmin=0, vmax=std_max)
+        axes[1, 1].set_xticks(range(len(param_names)))
+        axes[1, 1].set_yticks(range(len(param_names)))
+        axes[1, 1].set_xticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+        axes[1, 1].set_yticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+        axes[1, 1].set_title('Head 2 Standard Deviation', fontsize=36, fontweight='bold', fontfamily='Times New Roman')
+        for i in range(len(param_names)):
+            for j in range(len(param_names)):
+                v = head2_std[i, j].item()
+                axes[1, 1].text(j, i, f'{v:.3f}', ha='center', va='center',
+                                 color='white' if v > std_max / 2 else 'black', fontsize=20, fontweight='bold')
+        cbar5 = fig.colorbar(im5, ax=axes[1, 1], shrink=0.8)
+        cbar5.ax.tick_params(labelsize=24)
+
+        dual_std = layer_results['dual_head_std']
+        im6 = axes[1, 2].imshow(dual_std.numpy(), cmap='Reds', aspect='equal', vmin=0, vmax=std_max)
+        axes[1, 2].set_xticks(range(len(param_names)))
+        axes[1, 2].set_yticks(range(len(param_names)))
+        axes[1, 2].set_xticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+        axes[1, 2].set_yticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+        axes[1, 2].set_title('Dual-Head Average Standard Deviation', fontsize=36, fontweight='bold',
+                             fontfamily='Times New Roman')
+        for i in range(len(param_names)):
+            for j in range(len(param_names)):
+                v = dual_std[i, j].item()
+                axes[1, 2].text(j, i, f'{v:.3f}', ha='center', va='center',
+                                 color='white' if v > std_max / 2 else 'black', fontsize=20, fontweight='bold')
+        cbar6 = fig.colorbar(im6, ax=axes[1, 2], shrink=0.8)
+        cbar6.ax.tick_params(labelsize=24)
+
+        plt.suptitle(
+            f'Multi-Token Attention Statistics (Layer {layer_idx + 1}) - {num_samples} Samples',
+            fontsize=36, fontweight='bold', fontfamily='Times New Roman', y=0.98,
+        )
+        plt.tight_layout(rect=[0, 0, 1, 0.94])
+
+        fig_name = f'attention_statistics_layer{layer_idx + 1}_{num_samples}_samples'
+        plt.savefig(os.path.join(fig_save_path, f'{fig_name}.pdf'), format='pdf', bbox_inches='tight', pad_inches=0.1)
+        plt.savefig(os.path.join(fig_save_path, f'{fig_name}.png'), format='png', bbox_inches='tight', pad_inches=0.1)
+        print(f'Attention statistics figure saved to: {fig_save_path}')
+        plt.close()
