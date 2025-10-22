@@ -1,0 +1,984 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset, random_split
+import pandas as pd
+import numpy as np
+import matplotlib
+
+matplotlib.use('Agg')  # Use non-interactive backend; no GUI windows
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score
+from tqdm import tqdm
+import time
+from datetime import timedelta
+
+# Matplotlib font configuration
+plt.rcParams['font.family'] = ['Times New Roman', 'SimHei']  # Use Times New Roman for English and SimHei for Chinese
+plt.rcParams['axes.unicode_minus'] = False
+
+# Figure saving configuration - academic style
+import os
+
+# Use paths relative to this script for portability/reproducibility
+script_dir = os.path.dirname(os.path.abspath(__file__))
+fig_save_path = os.path.join(script_dir, 'fig')
+os.makedirs(fig_save_path, exist_ok=True)  # Create directory if it doesn't exist
+
+# High-quality figure parameters
+plt.rcParams['figure.dpi'] = 300  # high resolution
+plt.rcParams['savefig.dpi'] = 300  # high resolution when saving
+plt.rcParams['savefig.bbox'] = 'tight'  # tight layout crop
+plt.rcParams['savefig.pad_inches'] = 0.1  # padding
+
+# 1. Data preparation
+print("1. Preparing data...")
+
+# Load TE and TM data files (relative paths)
+data_dir = os.path.join(script_dir, 'data')
+file_path_te = os.path.join(data_dir, 'TE.csv')  # TE mode diffraction efficiency
+file_path_tm = os.path.join(data_dir, 'TM.csv')  # TM mode diffraction efficiency
+
+print("Reading TE data...")
+df_te = pd.read_csv(file_path_te, encoding_errors='ignore')
+print(f"TE data shape: {df_te.shape}")
+print(f"TE columns: {df_te.columns.tolist()}")
+
+print("Reading TM data...")
+df_tm = pd.read_csv(file_path_tm, encoding_errors='ignore')
+print(f"TM data shape: {df_tm.shape}")
+print(f"TM columns: {df_tm.columns.tolist()}")
+
+# Check if the two files have the same number of rows
+if df_te.shape[0] != df_tm.shape[0]:
+    raise ValueError(f"Row count mismatch between TE and TM data files: {df_te.shape[0]} vs {df_tm.shape[0]}")
+
+# Use the first four columns as input features (assuming same column order)
+X = df_te.iloc[:, :4].values  # first four columns: input parameters
+
+# Use the 5th column from both files as dual-output targets
+y_te = df_te.iloc[:, 4].values.reshape(-1, 1)  # TE mode diffraction efficiency
+y_tm = df_tm.iloc[:, 4].values.reshape(-1, 1)  # TM mode diffraction efficiency
+y = np.column_stack([y_te.flatten(), y_tm.flatten()])  # combine into dual outputs
+
+print(f"Input feature shape: {X.shape}")
+print(f"Target shape: {y.shape}")
+print("Using dual-mode outputs: TE and TM diffraction efficiency")
+print("Using multi-token architecture: each parameter is an independent token")
+
+# Feature standardization
+scaler_X = StandardScaler()
+X = scaler_X.fit_transform(X)
+
+# Convert to tensors
+X_tensor = torch.tensor(X, dtype=torch.float32)
+y_tensor = torch.tensor(y, dtype=torch.float32)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Device: {device}")
+
+# Create dataset and split
+dataset = TensorDataset(X_tensor, y_tensor)
+train_ratio = 0.6  # train set ratio
+# train/test split ratio
+train_size = int(train_ratio * len(X_tensor))
+test_size = len(X_tensor) - train_size
+train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+X_train, y_train = train_dataset[:][0].to(device), train_dataset[:][1].to(device)
+X_test, y_test = test_dataset[:][0].to(device), test_dataset[:][1].to(device)
+
+print(f"Dataset split info:")
+print(f"  Total samples: {len(X_tensor)}")
+print(f"  Train ratio: {train_ratio:.1f} ({train_size} samples)")
+print(f"  Test ratio: {1 - train_ratio:.1f} ({test_size} samples)")
+print(f"  Train/Test split: {train_size}/{test_size}")
+
+
+# 2. Multi-token model definition - dual-output attention network
+class MultiTokenDualOutputPhysicsInformedAttentionNet(nn.Module):
+    def __init__(self, input_dim, d_model=128, num_heads=1, num_layers=2):
+        super().__init__()
+        self.input_dim = input_dim
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+
+    # Each parameter has its own token embedding (key difference vs single-token model)
+    # Map each parameter to d_model dimensions
+        self.token_embeddings = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(1, d_model),
+                nn.LayerNorm(d_model),
+                nn.ReLU()
+            ) for _ in range(input_dim)
+        ])
+
+    # Transformer encoder layers (we will approximate attention weights later)
+        self.transformer_layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=num_heads,
+                dim_feedforward=256,
+                dropout=0.1,
+                batch_first=True
+            ) for _ in range(num_layers)
+        ])
+
+    # Dual output branch - TE mode (same as single-token branch)
+        self.te_output = nn.Sequential(
+            nn.Linear(d_model, 128),
+            nn.ReLU(),
+            nn.Linear(128, 512),
+            nn.ReLU(),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+
+    # Dual output branch - TM mode (same as single-token branch)
+        self.tm_output = nn.Sequential(
+            nn.Linear(d_model, 128),
+            nn.ReLU(),
+            nn.Linear(128, 512),
+            nn.ReLU(),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+
+    def forward(self, x, return_attention=False):
+        batch_size = x.size(0)
+
+        # Convert each parameter to an independent token (core difference vs single-token model)
+        # x shape: [batch_size, input_dim] -> tokens: [batch_size, input_dim, d_model]
+        tokens = []
+        for i in range(self.input_dim):
+            # Extract the i-th parameter [batch_size, 1]
+            param = x[:, i:i + 1]
+            # Convert via the corresponding embedding layer [batch_size, d_model]
+            token = self.token_embeddings[i](param)
+            tokens.append(token)
+
+    # Stack all tokens [batch_size, input_dim, d_model]
+        token_sequence = torch.stack(tokens, dim=1)
+
+    # Process token sequence through Transformer layers
+        attention_weights = []
+        encoded_tokens = token_sequence
+
+        if return_attention:
+            # Approximate dual-head attention weights
+            for i, layer in enumerate(self.transformer_layers):
+                # Compute dual-head attention weights
+                d_k = self.d_model // self.num_heads
+                multi_head_attention = []
+
+                for head in range(self.num_heads):
+                    # Each head processes a slice of the dimensions
+                    start_dim = head * d_k
+                    end_dim = (head + 1) * d_k
+
+                    # Extract features for this head
+                    head_tokens = encoded_tokens[:, :, start_dim:end_dim]  # [batch, seq, d_k]
+
+                    # Compute attention proxy for this head
+                    norm_tokens = torch.nn.functional.normalize(head_tokens, dim=-1)
+                    head_attention = torch.matmul(norm_tokens, norm_tokens.transpose(-2, -1))
+                    head_attention = torch.softmax(head_attention, dim=-1)
+
+                    multi_head_attention.append(head_attention)
+
+                # Stack multi-head attention [batch_size, num_heads, seq_len, seq_len]
+                layer_attention = torch.stack(multi_head_attention, dim=1)
+                attention_weights.append(layer_attention.detach().cpu())
+
+                # Forward through transformer layer
+                encoded_tokens = layer(encoded_tokens)
+        else:
+            # Regular forward pass
+            for layer in self.transformer_layers:
+                encoded_tokens = layer(encoded_tokens)
+
+    # Aggregate tokens via mean pooling (similar to single-token processing)
+    # [batch_size, input_dim, d_model] -> [batch_size, d_model]
+        pooled_features = encoded_tokens.mean(dim=1)
+
+    # Dual output branches (same as single-token model)
+        te_out = self.te_output(pooled_features)  # [batch_size, 1]
+        tm_out = self.tm_output(pooled_features)  # [batch_size, 1]
+
+    # Concatenate the two outputs
+        outputs = torch.cat([te_out, tm_out], dim=1)  # [batch_size, 2]
+
+        if return_attention:
+            return outputs, attention_weights
+        else:
+            return outputs
+
+
+print("\n2. Initializing multi-token dual-output model...")
+model = MultiTokenDualOutputPhysicsInformedAttentionNet(
+    input_dim=X_train.shape[1],  # 4 parameters = 4 tokens
+    d_model=128,
+    num_heads=2,
+    num_layers=1
+).to(device)
+
+# Show model parameter counts
+total_params = sum(p.numel() for p in model.parameters())
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"Total parameters: {total_params:,}")
+print(f"Trainable parameters: {trainable_params:,}")
+
+# 3. Training configuration
+criterion = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
+
+train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=128, shuffle=True)
+
+# 4. Training loop
+print("\n3. Start training multi-token model (overall progress)...")
+train_losses = []
+val_losses = []
+sampled_train_losses = []
+sampled_val_losses = []
+sampled_success_rates_005 = []  # Store success rate (delta=0.05)
+sampled_success_rates_01 = []  # Store success rate (delta=0.1)
+sampled_r2_scores = []  # Store overall R^2
+sampled_r2_scores_te = []  # Store TE-mode R^2
+sampled_r2_scores_tm = []  # Store TM-mode R^2
+sample_epochs = []
+delta = 0.05  # success threshold
+delta2 = 0.1  # second success threshold
+
+best_loss = float('inf')
+total_epochs = 200  # same number of epochs as single-token model
+total_steps = total_epochs * len(train_loader)
+start_time = time.time()
+
+progress_bar = tqdm(total=total_steps, desc="Multi-Token Training", unit="batch")
+
+for epoch in range(total_epochs):
+    model.train()
+    epoch_loss = 0
+
+    for X_batch, y_batch in train_loader:
+        optimizer.zero_grad()
+        outputs = model(X_batch)
+        loss = criterion(outputs, y_batch)
+        loss.backward()
+        optimizer.step()
+        epoch_loss += loss.item()
+
+    # Update progress bar
+        elapsed = time.time() - start_time
+        steps_completed = epoch * len(train_loader) + 1
+        samples_processed = steps_completed * train_loader.batch_size
+        samples_per_sec = samples_processed / elapsed if elapsed > 0 else 0
+        progress_bar.update(1)
+        progress_bar.set_postfix({
+            'Epoch': f'{epoch + 1}/{total_epochs}',
+            'Loss': f'{loss.item():.4f}',
+            'Samples/sec': f'{samples_per_sec:.1f}',
+            'Elapsed': str(timedelta(seconds=int(elapsed)))
+        })
+
+    avg_train_loss = epoch_loss / len(train_loader)
+    train_losses.append(avg_train_loss)
+
+    model.eval()
+    with torch.no_grad():
+        val_outputs = model(X_test)
+        val_loss = criterion(val_outputs, y_test).item()
+        val_losses.append(val_loss)
+
+    scheduler.step(val_loss)
+
+    # Record sampled losses and success rates
+    if (epoch + 1) % 5 == 0:
+        sampled_train_losses.append(avg_train_loss)
+        sampled_val_losses.append(val_loss)
+
+        # Compute success rates for two thresholds and R^2 scores
+        with torch.no_grad():
+            val_predictions = model(X_test).cpu().numpy()
+            val_true = y_test.cpu().numpy()
+
+            # Success rate (delta=0.05)
+            success_mask_005 = np.all(np.abs(val_predictions - val_true) < delta, axis=1)
+            success_rate_005 = np.mean(success_mask_005) * 100
+            sampled_success_rates_005.append(success_rate_005)
+
+            # Success rate (delta=0.1)
+            success_mask_01 = np.all(np.abs(val_predictions - val_true) < delta2, axis=1)
+            success_rate_01 = np.mean(success_mask_01) * 100
+            sampled_success_rates_01.append(success_rate_01)
+
+            # Compute R^2 scores
+            r2_overall = r2_score(val_true, val_predictions)
+            r2_te = r2_score(val_true[:, 0], val_predictions[:, 0])  # TE模式R²
+            r2_tm = r2_score(val_true[:, 1], val_predictions[:, 1])  # TM模式R²
+            sampled_r2_scores.append(r2_overall)
+            sampled_r2_scores_te.append(r2_te)
+            sampled_r2_scores_tm.append(r2_tm)
+
+        sample_epochs.append(epoch + 1)
+
+    # Save best model
+    if val_loss < best_loss:
+        best_loss = val_loss
+        torch.save(model.state_dict(), 'best_multi_token_model.pth')
+
+# Save feature scaler
+import pickle
+
+with open('scaler_X_multi_token.pkl', 'wb') as f:
+    pickle.dump(scaler_X, f)
+print("The multi-Token standardizer has been saved. scaler_X_multi_token.pkl")
+
+progress_bar.close()
+
+# 5. After training: plot sampled loss, success rate, and R^2
+
+# Figure 1: Loss curves
+fig1, ax1 = plt.subplots(1, 1, figsize=(12, 8))
+ax1.plot(sample_epochs, sampled_train_losses, 'o-', color='#2E86AB', linewidth=2,
+         markersize=6, label='Training Loss', alpha=0.8)
+ax1.plot(sample_epochs, sampled_val_losses, 's-', color='#A23B72', linewidth=2,
+         markersize=6, label='Validation Loss', alpha=0.8)
+ax1.set_xlabel('Epoch', fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+ax1.set_ylabel('Loss', fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+ax1.set_title('Multi-Token Training and Validation Loss Curve', fontsize=26, fontweight='bold',
+              fontfamily='Times New Roman', pad=15)
+ax1.legend(frameon=False, fancybox=True, shadow=False, prop={'family': 'Times New Roman', 'size': 20})
+ax1.grid(True, alpha=0.3, linestyle='--')
+ax1.tick_params(axis='both', which='major', labelsize=28)
+# Make tick labels bold
+for label in ax1.get_xticklabels() + ax1.get_yticklabels():
+    label.set_fontweight('bold')
+ax1.spines['top'].set_linewidth(2)
+ax1.spines['bottom'].set_linewidth(2)
+ax1.spines['left'].set_linewidth(2)
+ax1.spines['right'].set_linewidth(2)
+
+plt.tight_layout()
+fig_name1 = 'multi_token_loss_curve'
+plt.savefig(os.path.join(fig_save_path, f'{fig_name1}.pdf'), format='pdf', bbox_inches='tight', pad_inches=0.1)
+plt.savefig(os.path.join(fig_save_path, f'{fig_name1}.png'), format='png', bbox_inches='tight', pad_inches=0.1)
+plt.close()  # Close figure to free memory
+
+# Figure 2: Success rate curves
+fig2, ax2 = plt.subplots(1, 1, figsize=(12, 8))
+ax2.plot(sample_epochs, sampled_success_rates_005, 'd-', color='#F39C12', linewidth=2,
+         markersize=6, label=f'Success Rate (δ={delta})', alpha=0.8)
+ax2.plot(sample_epochs, sampled_success_rates_01, '^-', color='#27AE60', linewidth=2,
+         markersize=6, label=f'Success Rate (δ={delta2})', alpha=0.8)
+ax2.set_xlabel('Epoch', fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+ax2.set_ylabel('Success Rate (%)', fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+ax2.set_title('Multi-Token Success Rate Progress (Multiple Thresholds)', fontsize=26, fontweight='bold',
+              fontfamily='Times New Roman', pad=15)
+ax2.legend(frameon=False, fancybox=True, shadow=False, prop={'family': 'Times New Roman', 'size': 20})
+ax2.grid(True, alpha=0.3, linestyle='--')
+ax2.set_ylim(0, 100)
+ax2.tick_params(axis='both', which='major', labelsize=28)
+# Make tick labels bold
+for label in ax2.get_xticklabels() + ax2.get_yticklabels():
+    label.set_fontweight('bold')
+ax2.spines['top'].set_linewidth(2)
+ax2.spines['bottom'].set_linewidth(2)
+ax2.spines['left'].set_linewidth(2)
+ax2.spines['right'].set_linewidth(2)
+
+plt.tight_layout()
+fig_name2 = 'multi_token_success_rate'
+plt.savefig(os.path.join(fig_save_path, f'{fig_name2}.pdf'), format='pdf', bbox_inches='tight', pad_inches=0.1)
+plt.savefig(os.path.join(fig_save_path, f'{fig_name2}.png'), format='png', bbox_inches='tight', pad_inches=0.1)
+plt.close()  # Close figure to free memory
+
+# Figure 3: R^2 curves
+fig3, ax3 = plt.subplots(1, 1, figsize=(12, 8))
+ax3.plot(sample_epochs, sampled_r2_scores_te, 'o-', color='#E74C3C', linewidth=2,
+         markersize=6, label='TE Mode R² Score', alpha=0.8)
+ax3.plot(sample_epochs, sampled_r2_scores_tm, 's-', color='#3498DB', linewidth=2,
+         markersize=6, label='TM Mode R² Score', alpha=0.8)
+ax3.plot(sample_epochs, sampled_r2_scores, 'd-', color='#9B59B6', linewidth=2,
+         markersize=6, label='Overall R² Score', alpha=0.8)
+ax3.set_xlabel('Epoch', fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+ax3.set_ylabel('R2 Score', fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+ax3.set_title('Multi-Token R2 Score Progress (TE, TM & Overall)', fontsize=26, fontweight='bold',
+              fontfamily='Times New Roman', pad=15)
+ax3.legend(loc='lower right', frameon=False, fancybox=True, shadow=False,
+           prop={'family': 'Times New Roman', 'size': 20})
+ax3.grid(True, alpha=0.3, linestyle='--')
+ax3.set_ylim(0, 1)
+ax3.tick_params(axis='both', which='major', labelsize=28)
+# Make tick labels bold
+for label in ax3.get_xticklabels() + ax3.get_yticklabels():
+    label.set_fontweight('bold')
+ax3.spines['top'].set_linewidth(2)
+ax3.spines['bottom'].set_linewidth(2)
+ax3.spines['left'].set_linewidth(2)
+ax3.spines['right'].set_linewidth(2)
+
+plt.tight_layout()
+fig_name3 = 'multi_token_r2_score'
+plt.savefig(os.path.join(fig_save_path, f'{fig_name3}.pdf'), format='pdf', bbox_inches='tight', pad_inches=0.1)
+plt.savefig(os.path.join(fig_save_path, f'{fig_name3}.png'), format='png', bbox_inches='tight', pad_inches=0.1)
+plt.close()  # Close figure to free memory
+
+print(f"Three training figures saved to: {fig_save_path}")
+print(f"  • multi_token_loss_curve.pdf/.png - Loss curves")
+print(f"  • multi_token_success_rate.pdf/.png - Success rate curves")
+print(f"  • multi_token_r2_score.pdf/.png - R^2 score curves")
+
+# 6. Attention weight visualization
+print("\n6. Visualizing attention weights...")
+
+
+def visualize_attention_weights(model, X_data, y_data, num_samples=3):
+    """
+    Visualized multi-token attention weights
+    """
+    model.eval()
+
+    # Randomly select several samples
+    indices = torch.randperm(X_data.size(0))[:num_samples]
+
+    param_names = ['n', 'λ', 'α', 'h']
+
+    with torch.no_grad():
+        for idx, sample_idx in enumerate(indices):
+            sample_input = X_data[sample_idx:sample_idx + 1]
+            sample_output = y_data[sample_idx:sample_idx + 1]
+
+            # Get model outputs and attention weights
+            outputs, attention_weights = model(sample_input, return_attention=True)
+
+            # Inverse-transform inputs for display
+            original_params = scaler_X.inverse_transform(sample_input.cpu().numpy())
+            te_pred, tm_pred = outputs[0, 0].item(), outputs[0, 1].item()
+            te_true, tm_true = sample_output[0, 0].item(), sample_output[0, 1].item()
+
+            print(f"\n--- Sample {idx + 1} (index {sample_idx.item()}) ---")
+            print(f"Input parameters: {original_params[0]}")
+            print(f"Ground truth: TE={te_true:.4f}, TM={tm_true:.4f}")
+            print(f"Prediction: TE={te_pred:.4f}, TM={tm_pred:.4f}")
+
+            # Create visualization for dual-head attention at each layer
+            num_layers = len(attention_weights)
+
+            for layer_idx, attn_weight in enumerate(attention_weights):
+                print(f"Layer {layer_idx + 1} attention weights shape: {attn_weight.shape}")
+
+                # Expected shape: [batch_size, num_heads, seq_len, seq_len]
+                if attn_weight.dim() == 4 and attn_weight.shape[1] == 2:  # confirm dual-head
+                    # Create 1x3 subplots: Head1, Head2, Average
+                    fig, axes = plt.subplots(1, 3, figsize=(24, 8))
+
+                    # Head 1
+                    head1_attention = attn_weight[0, 0]  # [seq_len, seq_len]
+                    im1 = axes[0].imshow(head1_attention.numpy(), cmap='Blues', aspect='equal')
+                    axes[0].set_xticks(range(len(param_names)))
+                    axes[0].set_yticks(range(len(param_names)))
+                    axes[0].set_xticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+                    axes[0].set_yticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+                    axes[0].set_title(f'Head 1 Attention (Layer {layer_idx + 1})', fontsize=36, fontweight='bold',
+                                      fontfamily='Times New Roman')
+
+                    # Add numeric annotations
+                    for i in range(len(param_names)):
+                        for j in range(len(param_names)):
+                            text = axes[0].text(j, i, f'{head1_attention[i, j]:.3f}',
+                                                ha="center", va="center",
+                                                color="black" if head1_attention[i, j] < 0.5 else "white", fontsize=20,
+                                                fontweight='bold')
+                    # Bold colorbar tick labels
+                    cbar1 = plt.colorbar(im1, ax=axes[0], shrink=0.8)
+                    cbar1.ax.tick_params(labelsize=28)
+                    for label in cbar1.ax.get_yticklabels():
+                        label.set_fontweight('bold')
+
+                    # Head 2
+                    head2_attention = attn_weight[0, 1]  # [seq_len, seq_len]
+                    im2 = axes[1].imshow(head2_attention.numpy(), cmap='Greens', aspect='equal')
+                    axes[1].set_xticks(range(len(param_names)))
+                    axes[1].set_yticks(range(len(param_names)))
+                    axes[1].set_xticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+                    axes[1].set_yticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+                    axes[1].set_title(f'Head 2 Attention (Layer {layer_idx + 1})', fontsize=36, fontweight='bold',
+                                      fontfamily='Times New Roman')
+
+                    # Add numeric annotations
+                    for i in range(len(param_names)):
+                        for j in range(len(param_names)):
+                            text = axes[1].text(j, i, f'{head2_attention[i, j]:.3f}',
+                                                ha="center", va="center",
+                                                color="black" if head2_attention[i, j] < 0.5 else "white", fontsize=20,
+                                                fontweight='bold')
+                    # Bold colorbar tick labels
+                    cbar2 = plt.colorbar(im2, ax=axes[1], shrink=0.8)
+                    cbar2.ax.tick_params(labelsize=28)
+                    for label in cbar2.ax.get_yticklabels():
+                        label.set_fontweight('bold')
+
+                    # Average attention
+                    avg_attention = attn_weight[0].mean(dim=0)  # [seq_len, seq_len]
+                    im3 = axes[2].imshow(avg_attention.numpy(), cmap='Purples', aspect='equal')
+                    axes[2].set_xticks(range(len(param_names)))
+                    axes[2].set_yticks(range(len(param_names)))
+                    axes[2].set_xticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+                    axes[2].set_yticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+                    axes[2].set_title(f'Average Attention (Layer {layer_idx + 1})', fontsize=36, fontweight='bold',
+                                      fontfamily='Times New Roman')
+
+                    # Add numeric annotations
+                    for i in range(len(param_names)):
+                        for j in range(len(param_names)):
+                            text = axes[2].text(j, i, f'{avg_attention[i, j]:.3f}',
+                                                ha="center", va="center",
+                                                color="black" if avg_attention[i, j] < 0.5 else "white", fontsize=20,
+                                                fontweight='bold')
+                    # Bold colorbar tick labels
+                    cbar3 = plt.colorbar(im3, ax=axes[2], shrink=0.8)
+                    cbar3.ax.tick_params(labelsize=28)
+                    for label in cbar3.ax.get_yticklabels():
+                        label.set_fontweight('bold')
+
+                    plt.suptitle(f'Multi-Token Dual-Head Attention Weights - Sample {idx + 1} - Layer {layer_idx + 1}\n'
+                                 f'Input Parameters: n={original_params[0][0]:.3f}, λ={original_params[0][1]:.3f}, α={original_params[0][2]:.3f}, h={original_params[0][3]:.3f}',
+                                 fontsize=40, fontweight='bold', fontfamily='Times New Roman', y=0.98)
+                    plt.tight_layout(rect=[0, 0, 1, 0.92])  # leave space for the title
+
+                    # Ensure all text uses Times New Roman
+                    for ax in axes:
+                        for label in ax.get_xticklabels() + ax.get_yticklabels():
+                            label.set_fontfamily('Times New Roman')
+                        ax.title.set_fontfamily('Times New Roman')
+
+                    # Save figures - academic style
+                    fig_name = f'multi_token_attention_weights_sample{idx + 1}_layer{layer_idx + 1}'
+                    plt.savefig(os.path.join(fig_save_path, f'{fig_name}.pdf'), format='pdf', bbox_inches='tight',
+                                pad_inches=0.1)
+                    plt.savefig(os.path.join(fig_save_path, f'{fig_name}.png'), format='png', bbox_inches='tight',
+                                pad_inches=0.1)
+                    print(f"Attention weight figure saved to: {fig_save_path}")
+
+                    plt.close()  # Close figure to free memory
+
+                    # Print analysis of differences between the two heads
+                    print(f"\nLayer {layer_idx + 1} dual-head attention analysis:")
+                    print(f"Head 1 main focus:")
+                    head1_max_idx = torch.argmax(head1_attention)
+                    i1, j1 = head1_max_idx // len(param_names), head1_max_idx % len(param_names)
+                    print(f"  Strongest attention: {param_names[i1]} -> {param_names[j1]} ({head1_attention[i1, j1]:.3f})")
+
+                    print(f"Head 2 main focus:")
+                    head2_max_idx = torch.argmax(head2_attention)
+                    i2, j2 = head2_max_idx // len(param_names), head2_max_idx % len(param_names)
+                    print(f"  Strongest attention: {param_names[i2]} -> {param_names[j2]} ({head2_attention[i2, j2]:.3f})")
+
+                    # Compute similarity between the two heads
+                    head_similarity = torch.cosine_similarity(
+                        head1_attention.flatten(),
+                        head2_attention.flatten(),
+                        dim=0
+                    )
+                    print(f"Similarity between the two heads (cosine): {head_similarity:.3f}")
+
+                else:
+                    print(f"Warning: attention weights shape does not match dual-head expectation {attn_weight.shape}")
+                    # Fallback to single-head visualization
+                    if attn_weight.dim() == 3:
+                        avg_attention = attn_weight[0]
+                    else:
+                        avg_attention = torch.eye(len(param_names))
+
+                    fig, ax = plt.subplots(1, 1, figsize=(10, 8))
+                    im = ax.imshow(avg_attention.numpy(), cmap='Blues', aspect='equal')
+                    ax.set_xticks(range(len(param_names)))
+                    ax.set_yticks(range(len(param_names)))
+                    ax.set_xticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+                    ax.set_yticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+                    ax.set_title(f'Attention Layer {layer_idx + 1}', fontsize=36, fontweight='bold',
+                                 fontfamily='Times New Roman')
+
+                    for i in range(len(param_names)):
+                        for j in range(len(param_names)):
+                            if i < avg_attention.shape[0] and j < avg_attention.shape[1]:
+                                text = ax.text(j, i, f'{avg_attention[i, j]:.3f}',
+                                               ha="center", va="center",
+                                               color="black" if avg_attention[i, j] < 0.5 else "white", fontsize=20,
+                                               fontweight='bold')
+
+                    # Bold colorbar tick labels
+                    cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+                    cbar.ax.tick_params(labelsize=28)
+                    for label in cbar.ax.get_yticklabels():
+                        label.set_fontweight('bold')
+                    plt.tight_layout()
+
+                    # Ensure all text uses Times New Roman
+                    for label in ax.get_xticklabels() + ax.get_yticklabels():
+                        label.set_fontfamily('Times New Roman')
+                    ax.title.set_fontfamily('Times New Roman')
+
+                    # Save figures - academic style
+                    fig_name = f'multi_token_attention_layer{layer_idx + 1}_sample{idx + 1}'
+                    plt.savefig(os.path.join(fig_save_path, f'{fig_name}.pdf'), format='pdf', bbox_inches='tight',
+                                pad_inches=0.1)
+                    plt.savefig(os.path.join(fig_save_path, f'{fig_name}.png'), format='png', bbox_inches='tight',
+                                pad_inches=0.1)
+                    print(f"Attention layer figure saved to: {fig_save_path}")
+
+                    plt.close()  # Close figure to free memory
+
+
+# Execute attention weight visualization
+visualize_attention_weights(model, X_test, y_test, num_samples=3)
+
+# 7. Compute average attention weights over thousands of predictions
+print("\n7. Computing average attention weights over many predictions...")
+
+
+def compute_average_attention_weights(model, X_data, num_samples=5000):
+    """
+    Calculate the average attention weight and standard deviation of a large number of samples
+    """
+    model.eval()
+
+    # Limit the number of samples to available data
+    num_samples = min(num_samples, X_data.size(0))
+
+    # Randomly select sample indices
+    indices = torch.randperm(X_data.size(0))[:num_samples]
+
+    param_names = ['n', 'λ', 'α', 'h']
+    all_head1_weights = []
+    all_head2_weights = []
+
+    print(f"Processing attention weights for {num_samples} samples...")
+
+    with torch.no_grad():
+        for idx, sample_idx in enumerate(indices):
+            if idx % 1000 == 0:  # print progress every 1000 samples
+                print(f"Progress: {idx}/{num_samples}")
+
+            sample_input = X_data[sample_idx:sample_idx + 1]
+
+            # Get model outputs and attention weights
+            outputs, attention_weights = model(sample_input, return_attention=True)
+
+            # Store attention weights for each sample
+            for layer_idx, attn_weight in enumerate(attention_weights):
+                if attn_weight.dim() == 4 and attn_weight.shape[1] == 2:  # dual-head attention
+                    head1_attention = attn_weight[0, 0].cpu()  # [seq_len, seq_len]
+                    head2_attention = attn_weight[0, 1].cpu()  # [seq_len, seq_len]
+
+                    if idx == 0:  # initialize lists
+                        all_head1_weights.append([])
+                        all_head2_weights.append([])
+
+                    all_head1_weights[layer_idx].append(head1_attention)
+                    all_head2_weights[layer_idx].append(head2_attention)
+
+    # Compute mean attention weights and standard deviation
+    print("Computing mean attention weights and standard deviations...")
+    num_layers = len(all_head1_weights)
+
+    results = []
+    for layer_idx in range(num_layers):
+    # Head 1 statistics
+        head1_weights_stack = torch.stack(all_head1_weights[layer_idx])  # [num_samples, seq_len, seq_len]
+        head1_mean = head1_weights_stack.mean(dim=0)
+        head1_std = head1_weights_stack.std(dim=0)
+
+    # Head 2 statistics
+        head2_weights_stack = torch.stack(all_head2_weights[layer_idx])  # [num_samples, seq_len, seq_len]
+        head2_mean = head2_weights_stack.mean(dim=0)
+        head2_std = head2_weights_stack.std(dim=0)
+
+    # Dual-head averaged statistics
+        dual_head_mean = (head1_mean + head2_mean) / 2
+        dual_head_std = torch.sqrt((head1_std ** 2 + head2_std ** 2) / 2)
+
+        results.append({
+            'head1_mean': head1_mean,
+            'head1_std': head1_std,
+            'head2_mean': head2_mean,
+            'head2_std': head2_std,
+            'dual_head_mean': dual_head_mean,
+            'dual_head_std': dual_head_std
+        })
+
+    return results, param_names
+
+
+def visualize_average_attention_weights(results, param_names, num_samples):
+    """
+    Visualized average attention weights 
+    """
+    for layer_idx, layer_results in enumerate(results):
+        print(f"\n--- Average attention weight (Layer {layer_idx + 1}, {num_samples} 个样本) ---")
+
+    # Create a 2x3 subplot layout
+        fig, axes = plt.subplots(2, 3, figsize=(24, 16))
+
+    # First row: mean attention
+        # Head 1 Average Attention
+        head1_mean = layer_results['head1_mean']
+        im1 = axes[0, 0].imshow(head1_mean.numpy(), cmap='Blues', aspect='equal', vmin=0, vmax=1)
+        axes[0, 0].set_xticks(range(len(param_names)))
+        axes[0, 0].set_yticks(range(len(param_names)))
+        axes[0, 0].set_xticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+        axes[0, 0].set_yticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+        axes[0, 0].set_title('Head 1 Average Attention', fontsize=36, fontweight='bold', fontfamily='Times New Roman')
+
+        # Add numeric annotations
+        for i in range(len(param_names)):
+            for j in range(len(param_names)):
+                value = head1_mean[i, j].item()
+                text = axes[0, 0].text(j, i, f'{value:.3f}', ha="center", va="center",
+                                       color="white" if value > 0.5 else "black",
+                                       fontsize=20, fontweight='bold')
+
+        # Add colorbar
+        cbar1 = fig.colorbar(im1, ax=axes[0, 0], shrink=0.8)
+        cbar1.ax.tick_params(labelsize=24)
+        for label in cbar1.ax.get_yticklabels():
+            label.set_fontweight('bold')
+
+        # Head 2 Average Attention
+        head2_mean = layer_results['head2_mean']
+        im2 = axes[0, 1].imshow(head2_mean.numpy(), cmap='Greens', aspect='equal', vmin=0, vmax=1)
+        axes[0, 1].set_xticks(range(len(param_names)))
+        axes[0, 1].set_yticks(range(len(param_names)))
+        axes[0, 1].set_xticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+        axes[0, 1].set_yticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+        axes[0, 1].set_title('Head 2 Average Attention', fontsize=36, fontweight='bold', fontfamily='Times New Roman')
+
+        # Add numeric annotations
+        for i in range(len(param_names)):
+            for j in range(len(param_names)):
+                value = head2_mean[i, j].item()
+                text = axes[0, 1].text(j, i, f'{value:.3f}', ha="center", va="center",
+                                       color="white" if value > 0.5 else "black",
+                                       fontsize=20, fontweight='bold')
+
+        # Add colorbar
+        cbar2 = fig.colorbar(im2, ax=axes[0, 1], shrink=0.8)
+        cbar2.ax.tick_params(labelsize=24)
+        for label in cbar2.ax.get_yticklabels():
+            label.set_fontweight('bold')
+
+        # Dual-Head Average Attention
+        dual_head_mean = layer_results['dual_head_mean']
+        im3 = axes[0, 2].imshow(dual_head_mean.numpy(), cmap='Purples', aspect='equal', vmin=0, vmax=1)
+        axes[0, 2].set_xticks(range(len(param_names)))
+        axes[0, 2].set_yticks(range(len(param_names)))
+        axes[0, 2].set_xticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+        axes[0, 2].set_yticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+        axes[0, 2].set_title('Dual-Head Average Attention', fontsize=36, fontweight='bold',
+                             fontfamily='Times New Roman')
+
+        # Add numeric annotations
+        for i in range(len(param_names)):
+            for j in range(len(param_names)):
+                value = dual_head_mean[i, j].item()
+                text = axes[0, 2].text(j, i, f'{value:.3f}', ha="center", va="center",
+                                       color="white" if value > 0.5 else "black",
+                                       fontsize=20, fontweight='bold')
+
+        # Add colorbar
+        cbar3 = fig.colorbar(im3, ax=axes[0, 2], shrink=0.8)
+        cbar3.ax.tick_params(labelsize=24)
+        for label in cbar3.ax.get_yticklabels():
+            label.set_fontweight('bold')
+
+    # Second row: standard deviation
+        # Head 1 Standard Deviation
+        head1_std = layer_results['head1_std']
+        std_max = max(head1_std.max().item(), layer_results['head2_std'].max().item(),
+                      layer_results['dual_head_std'].max().item())
+        im4 = axes[1, 0].imshow(head1_std.numpy(), cmap='Reds', aspect='equal', vmin=0, vmax=std_max)
+        axes[1, 0].set_xticks(range(len(param_names)))
+        axes[1, 0].set_yticks(range(len(param_names)))
+        axes[1, 0].set_xticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+        axes[1, 0].set_yticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+        axes[1, 0].set_title('Head 1 Standard Deviation', fontsize=36, fontweight='bold', fontfamily='Times New Roman')
+
+        # Add numeric annotations
+        for i in range(len(param_names)):
+            for j in range(len(param_names)):
+                value = head1_std[i, j].item()
+                text = axes[1, 0].text(j, i, f'{value:.3f}', ha="center", va="center",
+                                       color="white" if value > std_max / 2 else "black",
+                                       fontsize=20, fontweight='bold')
+
+        # Add colorbar
+        cbar4 = fig.colorbar(im4, ax=axes[1, 0], shrink=0.8)
+        cbar4.ax.tick_params(labelsize=24)
+        for label in cbar4.ax.get_yticklabels():
+            label.set_fontweight('bold')
+
+        # Head 2 Standard Deviation
+        head2_std = layer_results['head2_std']
+        im5 = axes[1, 1].imshow(head2_std.numpy(), cmap='Reds', aspect='equal', vmin=0, vmax=std_max)
+        axes[1, 1].set_xticks(range(len(param_names)))
+        axes[1, 1].set_yticks(range(len(param_names)))
+        axes[1, 1].set_xticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+        axes[1, 1].set_yticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+        axes[1, 1].set_title('Head 2 Standard Deviation', fontsize=36, fontweight='bold', fontfamily='Times New Roman')
+
+        # Add numeric annotations
+        for i in range(len(param_names)):
+            for j in range(len(param_names)):
+                value = head2_std[i, j].item()
+                text = axes[1, 1].text(j, i, f'{value:.3f}', ha="center", va="center",
+                                       color="white" if value > std_max / 2 else "black",
+                                       fontsize=20, fontweight='bold')
+
+        # Add colorbar
+        cbar5 = fig.colorbar(im5, ax=axes[1, 1], shrink=0.8)
+        cbar5.ax.tick_params(labelsize=24)
+        for label in cbar5.ax.get_yticklabels():
+            label.set_fontweight('bold')
+
+        # Dual-Head Average Standard Deviation
+        dual_head_std = layer_results['dual_head_std']
+        im6 = axes[1, 2].imshow(dual_head_std.numpy(), cmap='Reds', aspect='equal', vmin=0, vmax=std_max)
+        axes[1, 2].set_xticks(range(len(param_names)))
+        axes[1, 2].set_yticks(range(len(param_names)))
+        axes[1, 2].set_xticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+        axes[1, 2].set_yticklabels(param_names, fontsize=32, fontweight='bold', fontfamily='Times New Roman')
+        axes[1, 2].set_title('Dual-Head Average Standard Deviation', fontsize=36, fontweight='bold',
+                             fontfamily='Times New Roman')
+
+        # Add numeric annotations
+        for i in range(len(param_names)):
+            for j in range(len(param_names)):
+                value = dual_head_std[i, j].item()
+                text = axes[1, 2].text(j, i, f'{value:.3f}', ha="center", va="center",
+                                       color="white" if value > std_max / 2 else "black",
+                                       fontsize=20, fontweight='bold')
+
+        # Add colorbar
+        cbar6 = fig.colorbar(im6, ax=axes[1, 2], shrink=0.8)
+        cbar6.ax.tick_params(labelsize=24)
+        for label in cbar6.ax.get_yticklabels():
+            label.set_fontweight('bold')
+
+        # Set overall title
+        plt.suptitle(f'Multi-Token Attention Statistics (Layer {layer_idx + 1}) - {num_samples} Samples',
+                     fontsize=36, fontweight='bold', fontfamily='Times New Roman', y=0.98)
+
+        plt.tight_layout(rect=[0, 0, 1, 0.94])  # leave space for the title
+
+        # Save figures
+        fig_name = f'attention_statistics_layer{layer_idx + 1}_{num_samples}_samples'
+        plt.savefig(os.path.join(fig_save_path, f'{fig_name}.pdf'), format='pdf', bbox_inches='tight', pad_inches=0.1)
+        plt.savefig(os.path.join(fig_save_path, f'{fig_name}.png'), format='png', bbox_inches='tight', pad_inches=0.1)
+        print(f"Attention statistics figure saved to: {fig_save_path}")
+
+        plt.close()  # Close figure to free memory
+
+        # Print statistical analysis
+        print(f"Layer {layer_idx + 1} attention weight statistical analysis:")
+
+        # Head 1 analysis
+        head1_max_idx = torch.argmax(head1_mean)
+        i_max, j_max = head1_max_idx // len(param_names), head1_max_idx % len(param_names)
+        print(
+            f"Head 1 strongest attention link: {param_names[i_max]} -> {param_names[j_max]} ({head1_mean[i_max, j_max]:.3f} ± {head1_std[i_max, j_max]:.3f})")
+
+        # Head 2 analysis
+        head2_max_idx = torch.argmax(head2_mean)
+        i_max, j_max = head2_max_idx // len(param_names), head2_max_idx % len(param_names)
+        print(
+            f"Head 2 strongest attention link: {param_names[i_max]} -> {param_names[j_max]} ({head2_mean[i_max, j_max]:.3f} ± {head2_std[i_max, j_max]:.3f})")
+
+        # Dual-head analysis
+        dual_max_idx = torch.argmax(dual_head_mean)
+        i_max, j_max = dual_max_idx // len(param_names), dual_max_idx % len(param_names)
+        print(
+            f"Dual-head strongest attention link: {param_names[i_max]} -> {param_names[j_max]} ({dual_head_mean[i_max, j_max]:.3f} ± {dual_head_std[i_max, j_max]:.3f})")
+
+        # Similarity analysis between the two heads
+        head_similarity = torch.cosine_similarity(head1_mean.flatten(), head2_mean.flatten(), dim=0)
+        print(f"Similarity between Head 1 and Head 2 (cosine): {head_similarity:.3f}")
+
+        print(
+            f"Mean std: Head 1 = {head1_std.mean():.4f}, Head 2 = {head2_std.mean():.4f}, Dual-head = {dual_head_std.mean():.4f}")
+
+
+# Compute and visualize average attention weights
+num_samples_for_avg = min(5000, X_test.size(0))  # use up to 5000 samples
+results, param_names = compute_average_attention_weights(model, X_test, num_samples_for_avg)
+visualize_average_attention_weights(results, param_names, num_samples_for_avg)
+
+# 8. Compute and display final performance metrics
+print("\n8. Computing final performance metrics...")
+
+# Load best model
+model.load_state_dict(torch.load('best_multi_token_model.pth'))
+model.eval()
+
+with torch.no_grad():
+    # Final prediction on test set
+    final_predictions = model(X_test).cpu().numpy()
+    final_true = y_test.cpu().numpy()
+
+    # Compute MSE
+    final_mse = np.mean((final_predictions - final_true) ** 2)
+
+    # Compute R^2 scores
+    final_r2_overall = r2_score(final_true, final_predictions)
+    final_r2_te = r2_score(final_true[:, 0], final_predictions[:, 0])  # TE模式R²
+    final_r2_tm = r2_score(final_true[:, 1], final_predictions[:, 1])  # TM模式R²
+
+    # Two success thresholds
+    delta1 = 0.05  # first success threshold
+    delta2 = 0.1  # second success threshold
+
+    # Success rate (delta=0.05)
+    success_mask_005 = np.all(np.abs(final_predictions - final_true) < delta1, axis=1)
+    final_success_rate_005 = np.mean(success_mask_005) * 100
+
+    # Success rate (delta=0.1)
+    success_mask_01 = np.all(np.abs(final_predictions - final_true) < delta2, axis=1)
+    final_success_rate_01 = np.mean(success_mask_01) * 100
+
+print("\n" + "=" * 60)
+print("Multi-token model: Final metrics")
+print("=" * 60)
+print(f"Test set size: {len(final_true):,} samples")
+print(f"Final MSE: {final_mse:.6f}")
+print(f"Final R^2 (overall): {final_r2_overall:.6f}")
+print(f"Final R^2 (TE mode): {final_r2_te:.6f}")
+print(f"Final R^2 (TM mode): {final_r2_tm:.6f}")
+print(f"Success rate (δ={delta1}): {final_success_rate_005:.2f}%")
+print(f"Success rate (δ={delta2}): {final_success_rate_01:.2f}%")
+print("=" * 60)
+
+# Additional error analysis
+te_mae = np.mean(np.abs(final_predictions[:, 0] - final_true[:, 0]))
+tm_mae = np.mean(np.abs(final_predictions[:, 1] - final_true[:, 1]))
+overall_mae = np.mean(np.abs(final_predictions - final_true))
+
+te_mse = np.mean((final_predictions[:, 0] - final_true[:, 0]) ** 2)
+tm_mse = np.mean((final_predictions[:, 1] - final_true[:, 1]) ** 2)
+
+print(f"Mean Absolute Error (MAE):")
+print(f"   • Overall MAE: {overall_mae:.6f}")
+print(f"   • TE mode MAE: {te_mae:.6f}")
+print(f"   • TM mode MAE: {tm_mae:.6f}")
+print(f"MSE breakdown:")
+print(f"   • Overall MSE: {final_mse:.6f}")
+print(f"   • TE mode MSE: {te_mse:.6f}")
+print(f"   • TM mode MSE: {tm_mse:.6f}")
+
+print(f"\nTraining complete!")
+print(f"Model trained and saved.")
+print(f"Training generated loss curves, attention visualizations, and average attention statistics.")
+print(f"All figures saved to: {fig_save_path}")
