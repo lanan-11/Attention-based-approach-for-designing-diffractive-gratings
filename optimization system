@@ -181,7 +181,7 @@ class InteractiveOptimizationSystem:
         self.save_dir = r'C:\Users\windows\Desktop\工作区\attention for design diffractive grating\fig'
         os.makedirs(self.save_dir, exist_ok=True)
 
-        print("🔧 Interactive Grating Parameter Optimization (Multi-Token)")
+        print("Interactive Grating Parameter Optimization (Multi-Token)")
         print("=" * 50)
         print(f"Device: {self.device}")
         print("Using Multi-Token model — each parameter is an independent token")
@@ -224,28 +224,20 @@ class InteractiveOptimizationSystem:
         """Load parameter bounds"""
         print("\nSetting parameter bounds...")
 
-        try:
-            file_path_te = r'C:\Users\windows\Desktop\data\新三层矩形光栅\TE.csv'
-            df_te = pd.read_csv(file_path_te, encoding_errors='ignore')
-            X_range = df_te.iloc[:, :4].values
+        # Directly enforce user-specified ranges
+        # Units assumption:
+        # - lambda: nm (1300-1800)
+        # - n: refractive index (unitless)
+        # - alpha: degrees (30-50)
+        # - f: duty cycle (0-1)
+        # If your model expects other units, please convert before training/inference accordingly.
 
-            self.param_min = torch.tensor(X_range.min(axis=0), dtype=torch.float32, device=self.device)
-            self.param_max = torch.tensor(X_range.max(axis=0), dtype=torch.float32, device=self.device)
+        self.param_min = torch.tensor([1300.0, 1.0, 30.0, 0.3], dtype=torch.float32, device=self.device)
+        self.param_max = torch.tensor([1800.0, 4.0, 50.0, 0.5], dtype=torch.float32, device=self.device)
 
-            print(f"Parameter bounds:")
-            for i, name in enumerate(self.param_names):
-                print(f"  {name}: [{self.param_min[i]:.4f}, {self.param_max[i]:.4f}]")
-
-        except Exception as e:
-            print(f"Warning: Unable to read source CSV; using default parameter bounds")
-            print(f"Error: {e}")
-            # Reasonable default ranges
-            self.param_min = torch.tensor([0.0, 0.0, 0.0, 0.0], dtype=torch.float32, device=self.device)
-            self.param_max = torch.tensor([1.0, 1.0, 90.0, 2000.0], dtype=torch.float32, device=self.device)
-
-            print(f"Using default parameter bounds:")
-            for i, name in enumerate(self.param_names):
-                print(f"  {name}: [{self.param_min[i]:.4f}, {self.param_max[i]:.4f}]")
+        print(f"Parameter bounds (overridden):")
+        for i, name in enumerate(self.param_names):
+            print(f"  {name}: [{self.param_min[i]:.4f}, {self.param_max[i]:.4f}]")
 
     def get_user_constraints(self) -> Dict:
         """Get user parameter constraints"""
@@ -254,6 +246,7 @@ class InteractiveOptimizationSystem:
         print("="*50)
 
         constraints = {}
+        units = {"lambda": "nm", "n": "", "alpha": "deg", "f": ""}
 
         print("Select parameters to fix (multiple allowed):")
         print("1. lambda (wavelength)")
@@ -284,7 +277,9 @@ class InteractiveOptimizationSystem:
 
                         while True:
                             try:
-                                fixed_value = float(input(f"Enter fixed value for {param_name} (range: [{min_val:.4f}, {max_val:.4f}]): "))
+                                unit_str = units.get(param_name, "")
+                                unit_hint = f" {unit_str}" if unit_str else ""
+                                fixed_value = float(input(f"Enter fixed value for {param_name}{unit_hint} (range: [{min_val:.4f}, {max_val:.4f}]{unit_hint}): "))
                                 if min_val <= fixed_value <= max_val:
                                     constraints[param_name] = fixed_value
                                     fixed_params.append(param_name)
@@ -906,7 +901,7 @@ class InteractiveOptimizationSystem:
             fig, axes = plt.subplots(3, 3, figsize=(20, 12))
 
         fig.suptitle('Parameter Optimization Analysis', fontsize=16, fontweight='normal', y=0.98)
-        axes = axes.flatten() 
+        axes = axes.flatten()
 
         # 1. Efficiency Optimization History
         ax1 = axes[0]
@@ -932,8 +927,8 @@ class InteractiveOptimizationSystem:
         ax2.set_ylim(bottom=1e-6)
 
     # 3-6. Per-parameter optimization trajectories
-        colors = ['#2E86AB', '#F18F01', '#A23B72', '#7209B7'] 
-        param_plot_idx = 2  
+        colors = ['#2E86AB', '#F18F01', '#A23B72', '#7209B7']
+        param_plot_idx = 2
         subplot_labels = ['(c)', '(d)', '(e)', '(f)', '(g)', '(h)', '(i)']
 
         for i, param_name in enumerate(self.param_names):
